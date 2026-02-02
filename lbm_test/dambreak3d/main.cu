@@ -1,10 +1,15 @@
 /**
  * dambreak3d - Dam Break 3D Simulation (DILMaster Standalone)
  *
- * Ê¹ÓÃ LBMCore + FreeSurfaceModule Ö±½ÓÇı¶¯×ÔÓÉ±íÃæÀ£°ÓÄ£Äâ¡£
- * Êä³ö VTI ÎÄ¼ş (flags + velocity)£¬¿ÉÔÚ ParaView ÖĞ¿ÉÊÓ»¯¡£
+ * æ”¯æŒä¸¤ç§è¿è¡Œæ¨¡å¼:
+ *   --mode legacy   : åŸå§‹æ‰‹åŠ¨ç»„è£…æ¨¡å¼ (é»˜è®¤)
+ *   --mode scenario : ä½¿ç”¨ ScenarioRunner æ ‡å‡†åŒ–æµç¨‹
+ *
+ * ä½¿ç”¨ LBMCore + FreeSurfaceModule ç›´æ¥é©±åŠ¨ä¸‰ç»´æºƒååœºæ™¯æ¨¡æ‹Ÿã€‚
+ * è¾“å‡º VTI æ–‡ä»¶ (flags + velocity)ï¼Œå¯åœ¨ ParaView ä¸­å¯è§†åŒ–ã€‚
  */
 #include <cuda_runtime.h>
+#include <cstring>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -19,35 +24,38 @@
 #include "physics/lbm/LBMMemoryManager.hpp"
 #include "services/VTKService.hpp"
 
+// ScenarioRunner æ ‡å‡†åŒ–è·¯å¾„
+#include "ScenarioRunner.hpp"
+
 namespace fs = std::filesystem;
 
 // ============================================================================
-// ÅäÖÃ
+// å…±äº«é…ç½®
 // ============================================================================
 struct DamBreak3DConfig {
-    // Íø¸ñ³ß´ç
+    // ç½‘æ ¼å°ºå¯¸
     int nx = 64;
     int ny = 96;
     int nz = 96;
 
-    // ÎïÀí²ÎÊı
+    // ç‰©ç†å‚æ•°
     float nu = 0.005f;
     float gravity[3] = { 0.0f, 0.0f, -0.0002f };
     float sigma = 0.0001f;
     float rho0 = 1.0f;
 
-    // ³õÊ¼Ë®Öù·¶Î§ (±ÈÀı)
-    float water_z_ratio = 6.0f / 8.0f; // z ·½ÏòË®Î»¸ß¶È
-    float water_y_ratio = 1.0f / 8.0f; // y ·½ÏòË®Öù¿í¶È
+    // åˆå§‹æ°´å—èŒƒå›´ (æ¯”ä¾‹)
+    float water_z_ratio = 6.0f / 8.0f; // z æ–¹å‘æ°´ä½é«˜åº¦
+    float water_y_ratio = 1.0f / 8.0f; // y æ–¹å‘æ°´å—å®½åº¦
 
-    // Ä£Äâ¿ØÖÆ
+    // æ¨¡æ‹Ÿæ§åˆ¶
     int steps = 20000;
     std::string output_dir = "dambreak3d_output/";
     int output_interval = 100;
 };
 
 // ============================================================================
-// ¸¨Öúº¯Êı
+// è¾…åŠ©å‡½æ•°
 // ============================================================================
 static double calculateTotalMass(const std::vector<float>& phi,
     const std::vector<unsigned char>& flags,
@@ -55,7 +63,7 @@ static double calculateTotalMass(const std::vector<float>& phi,
     double totalMass = 0.0;
     for (int i = 0; i < nCells; ++i) {
         // TYPE_F=0x08 (Liquid), TYPE_I=0x10 (Interface)
-        if (flags[i] == 0x08 || flags[i] == 0x10) {
+        if (flags[i] == 0x08 || flags[i] == 0x10) { 
             totalMass += phi[i] * rho0;
         }
     }
@@ -63,20 +71,13 @@ static double calculateTotalMass(const std::vector<float>& phi,
 }
 
 // ============================================================================
-// Main
+// Mode 1: Legacy â€” åŸå§‹æ‰‹åŠ¨ç»„è£…æ¨¡å¼
 // ============================================================================
-int main(int argc, char** argv) {
-    std::cout << "=== DILMaster Dam Break 3D ===" << std::endl;
-
-    DamBreak3DConfig cfg;
-
-    // ÔÊĞíÃüÁîĞĞ¸²¸Ç²½Êı
-    if (argc > 1) {
-        cfg.steps = std::atoi(argv[1]);
-    }
+static int runLegacy(const DamBreak3DConfig& cfg) {
+    std::cout << "=== DILMaster Dam Break 3D [Legacy Mode] ===" << std::endl;
 
     // ------------------------------------------------------------------
-    // ¹¹½¨ LBM ÅäÖÃ
+    // é…ç½® LBM å‚æ•°
     // ------------------------------------------------------------------
     lbm::LBMConfig lbmConfig{};
     lbmConfig.nx = cfg.nx;
@@ -99,7 +100,7 @@ int main(int argc, char** argv) {
     std::cout << "sigma = " << cfg.sigma << std::endl;
 
     // ------------------------------------------------------------------
-    // ´´½¨Çó½âÆ÷×é¼ş
+    // åˆ›å»ºæ ¸å¿ƒä¸å†…å­˜
     // ------------------------------------------------------------------
     lbm::LBMMemoryManager memMgr;
     lbm::LBMCore lbmCore(lbmConfig, &memMgr);
@@ -108,7 +109,7 @@ int main(int argc, char** argv) {
     const int nCells = cfg.nx * cfg.ny * cfg.nz;
 
     // ------------------------------------------------------------------
-    // ×ÔÓÉ±íÃæÄ£¿é£ºÉèÖÃ³õÊ¼¼¸ºÎ
+    // è‡ªç”±è¡¨é¢æ¨¡å—ï¼šè®¾ç½®åˆå§‹å‡ ä½•
     // ------------------------------------------------------------------
     lbm::FreeSurfaceModule fsModule;
     fsModule.configure(lbmConfig);
@@ -116,11 +117,11 @@ int main(int argc, char** argv) {
     fsModule.allocate(memMgr);
     fsModule.initialize();
 
-    // 1) È«ÓòÉèÎª GAS
+    // 1) å…¨åŸŸè®¾ä¸º GAS
     fsModule.setRegion(0, cfg.nx - 1, 0, cfg.ny - 1, 0, cfg.nz - 1,
         lbm::CellType::GAS, 0.0f, cfg.rho0);
 
-    // 2) Ë®ÖùÇøÓòÉèÎª LIQUID
+    // 2) æ°´å—åŒºåŸŸè®¾ä¸º LIQUID
     const int water_z = static_cast<int>(cfg.nz * cfg.water_z_ratio);
     const int water_y = static_cast<int>(cfg.ny * cfg.water_y_ratio);
     std::cout << "Water block: x=[0," << cfg.nx - 1 << "], y=[0," << water_y - 1
@@ -129,13 +130,11 @@ int main(int argc, char** argv) {
     fsModule.setRegion(0, cfg.nx - 1, 0, water_y - 1, 0, water_z - 1,
         lbm::CellType::LIQUID, 1.0f, cfg.rho0);
 
-    // 3) ĞŞÕı½çÃæ²ã
+    // 3) ä¿®å¤ç•Œé¢å±‚
     fsModule.fixInterfaceLayer();
 
     // ------------------------------------------------------------------
-    // FieldStore£ºÎª VTKService Ìá¹©Êı¾İ
-    //   - "flags"    : uint8, nCells ¸öÔªËØ ¡ú Í¨¹ı fields ÁĞ±íÊä³ö
-    //   - "velocity" : float, nCells*3 (SoA) ¡ú VTKService ÌØÊâ´¦Àí
+    // FieldStoreï¼ˆä¸º VTKService æä¾›æ•°æ®ï¼‰
     // ------------------------------------------------------------------
     FieldStore fieldStore;
     fieldStore.create(
@@ -144,13 +143,12 @@ int main(int argc, char** argv) {
         FieldDesc{ "velocity", static_cast<size_t>(nCells * 3), sizeof(float) });
 
     // ------------------------------------------------------------------
-    // VTKService ÅäÖÃ
+    // VTKService é…ç½®
     // ------------------------------------------------------------------
     VTKService::Config vtkConfig;
     vtkConfig.output_dir = cfg.output_dir;
     vtkConfig.interval = cfg.output_interval;
-    vtkConfig.fields = { "flags" }; // flags ×ßÍ¨ÓÃ±êÁ¿Â·¾¶
-    // velocity ÓÉ VTKService ÄÚ²¿×Ô¶¯¼ì²â "velocity" ×Ö¶ÎÊä³ö (SoA¡ú½»´í)
+    vtkConfig.fields = { "flags" };
     vtkConfig.nx = cfg.nx;
     vtkConfig.ny = cfg.ny;
     vtkConfig.nz = cfg.nz;
@@ -164,14 +162,14 @@ int main(int argc, char** argv) {
     vtkService.initialize(ctx);
 
     // ------------------------------------------------------------------
-    // Ö÷»ú»º³åÇø
+    // ä¸»æœºç«¯ç¼“å†²åŒº
     // ------------------------------------------------------------------
     std::vector<unsigned char> h_flags(nCells);
     std::vector<float> h_phi(nCells);
     std::vector<float> h_rho(nCells);
     std::vector<float> h_u(nCells * 3);
 
-    // ÏÂÔØ³õÊ¼³¡²¢Í³¼Æ
+    // ä¸‹è½½åˆå§‹æ•°æ®ç»Ÿè®¡
     lbmCore.backend().download_fields(h_rho.data(), h_u.data(), h_flags.data(),
         h_phi.data());
     const double initialMass =
@@ -200,7 +198,7 @@ int main(int argc, char** argv) {
     std::cout << std::endl;
 
     // ------------------------------------------------------------------
-    // Ä£ÄâÖ÷Ñ­»·
+    // æ¨¡æ‹Ÿä¸»å¾ªç¯
     // ------------------------------------------------------------------
     std::cout << "Starting simulation for " << cfg.steps << " steps..."
         << std::endl;
@@ -210,26 +208,26 @@ int main(int argc, char** argv) {
         ctx.time = step * ctx.dt;
 
         if (step % cfg.output_interval == 0) {
-            // GPU ¡ú Host
+            // GPU â†’ Host
             lbmCore.backend().download_fields(h_rho.data(), h_u.data(),
                 h_flags.data(), h_phi.data());
 
-            // ¸üĞÂ FieldStore ÖĞµÄ flags
+            // æ›´æ–° FieldStore ä¸­çš„ flags
             {
                 auto handle = fieldStore.get("flags");
                 memcpy(handle.data(), h_flags.data(),
                     nCells * sizeof(unsigned char));
             }
-            // ¸üĞÂ FieldStore ÖĞµÄ velocity (SoA Ô­ÑùĞ´Èë)
+            // æ›´æ–° FieldStore ä¸­çš„ velocity (SoA åŸæ ·å†™å…¥)
             {
                 auto handle = fieldStore.get("velocity");
                 memcpy(handle.data(), h_u.data(), nCells * 3 * sizeof(float));
             }
 
-            // Ğ´ VTI ÎÄ¼ş
+            // å†™ VTI æ–‡ä»¶
             vtkService.onStepEnd(ctx);
 
-            // ¿ØÖÆÌ¨Í³¼Æ
+            // æ§åˆ¶å°ç»Ÿè®¡
             double currentMass =
                 calculateTotalMass(h_phi, h_flags, nCells, cfg.rho0);
             double massDiffPercent =
@@ -255,13 +253,13 @@ int main(int argc, char** argv) {
                 << std::noshowpos << "%)" << std::endl;
         }
 
-        // LBM ²½½ø£¨·Ö½×¶Î£¬×ÔÓÉ±íÃæ¹³×Ó²åÈë streaming ºÍºê¹Û¸üĞÂÖ®¼ä£©
-        fsModule.preStream(ctx);         // 1. ²¶»ñ³öÕ¾·Ö²¼
+        // LBM æ ¸å¿ƒè®¡ç®—å„é˜¶æ®µï¼ˆè‡ªç”±è¡¨é¢åµŒå…¥åœ¨ streaming å’Œåå®æ›´æ–°ä¹‹é—´ï¼‰
+        fsModule.preStream(ctx);         // 1. å¤‡ä»½æ—§åˆ†å¸ƒ
         lbmCore.streamCollide();         // 2. Streaming + Collision
-        fsModule.postStream(ctx);        // 3-5. ÖÊÁ¿½»»» + ±êÖ¾×ª»» + PhiÖØ¼ÆËã
-        lbmCore.updateMacroscopic();     // 6. ¸üĞÂºê¹Û³¡ + ´ò°ü + Í¬²½
+        fsModule.postStream(ctx);        // 3-5. è´¨é‡æ›´æ–° + æ ‡å¿—è½¬æ¢ + Phiå†åˆ†é…
+        lbmCore.updateMacroscopic();     // 6. æ›´æ–°å®è§‚é‡ + è¾¹ç•Œ + åŒæ­¥
 
-        // ½¡¿µ¼ì²é
+        // å¥å£®æ€§æ£€æŸ¥
         if (!lbmCore.checkHealth()) {
             std::cerr << "[FAIL] Simulation exploded at step " << step << std::endl;
             break;
@@ -269,7 +267,7 @@ int main(int argc, char** argv) {
     }
 
     // ------------------------------------------------------------------
-    // ×îÖÕ±¨¸æ
+    // æœ€ç»ˆæŠ¥å‘Š
     // ------------------------------------------------------------------
     vtkService.finalize(ctx);
 
@@ -294,4 +292,98 @@ int main(int argc, char** argv) {
     std::cout << "VTI files written to: " << cfg.output_dir << std::endl;
 
     return 0;
+}
+
+// ============================================================================
+// Mode 2: Scenario â€” ä½¿ç”¨ ScenarioRunner æ ‡å‡†åŒ–æµç¨‹
+// ============================================================================
+static int runScenarioMode(const DamBreak3DConfig& cfg) {
+    std::cout << "=== DILMaster Dam Break 3D [Scenario Mode] ===" << std::endl;
+
+    // æ„å»º LBMConfig
+    lbm::LBMConfig lbmConfig{};
+    lbmConfig.nx = cfg.nx;
+    lbmConfig.ny = cfg.ny;
+    lbmConfig.nz = cfg.nz;
+    lbmConfig.tau = 3.0f * cfg.nu + 0.5f;
+    lbmConfig.rho0 = cfg.rho0;
+    lbmConfig.u0 = make_float3(0.0f, 0.0f, 0.0f);
+    lbmConfig.gravity =
+        make_float3(cfg.gravity[0], cfg.gravity[1], cfg.gravity[2]);
+    lbmConfig.sigma = cfg.sigma;
+    lbmConfig.wallFlags = lbm::WALL_ALL;
+    lbmConfig.enableFreeSurface = true;
+
+    // æ•è·æ°´å—å‚æ•°ç”¨äº lambda
+    const int water_z = static_cast<int>(cfg.nz * cfg.water_z_ratio);
+    const int water_y = static_cast<int>(cfg.ny * cfg.water_y_ratio);
+
+    std::cout << "Grid: " << cfg.nx << " x " << cfg.ny << " x " << cfg.nz
+        << std::endl;
+    std::cout << "Water block: x=[0," << cfg.nx - 1 << "], y=[0," << water_y - 1
+        << "], z=[0," << water_z - 1 << "]" << std::endl;
+
+    // ç»„è£… ScenarioConfig
+    lbm_test::ScenarioConfig scenario;
+    scenario.name = "DamBreak3D";
+    scenario.config = lbmConfig;
+    scenario.steps = cfg.steps;
+    scenario.output_interval = cfg.output_interval;
+    scenario.dt = 1.0f;
+    scenario.output_dir = cfg.output_dir;
+
+    // é€šè¿‡ prepareGeometry å›è°ƒè®¾ç½®åˆå§‹å‡ ä½•
+    scenario.prepareGeometry =
+        [&cfg, water_y, water_z](lbm::FreeSurfaceModule& fs,
+                                  lbm::LBMMemoryManager& /*memMgr*/) {
+            // 1) å…¨åŸŸè®¾ä¸º GAS
+            fs.setRegion(0, cfg.nx - 1, 0, cfg.ny - 1, 0, cfg.nz - 1,
+                lbm::CellType::GAS, 0.0f, cfg.rho0);
+
+            // 2) æ°´å—åŒºåŸŸè®¾ä¸º LIQUID
+            fs.setRegion(0, cfg.nx - 1, 0, water_y - 1, 0, water_z - 1,
+                lbm::CellType::LIQUID, 1.0f, cfg.rho0);
+
+            // 3) ä¿®å¤ç•Œé¢å±‚
+            fs.fixInterfaceLayer();
+        };
+
+    // ä¸€è¡Œè°ƒç”¨å®Œæˆæ•´ä¸ªæ¨¡æ‹Ÿ
+    lbm_test::runScenario(scenario);
+
+    return 0;
+}
+
+// ============================================================================
+// å‘½ä»¤è¡Œå¸®åŠ©
+// ============================================================================
+static void printUsage(const char* progName) {
+    std::cout << "Usage: " << progName << " [options]\n"
+              << "\n"
+              << "Options:\n"
+              << "  --mode <legacy|scenario>  Run mode (default: legacy)\n"
+              << "  --steps <N>               Number of simulation steps (default: 20000)\n"
+              << "  -h, --help                Show this help message\n"
+              << std::endl;
+}
+
+// ============================================================================
+// Main â€” æ¨¡å¼åˆ†å‘
+// ============================================================================
+int main(int argc, char** argv) {
+    DamBreak3DConfig cfg;
+    std::string mode = "scenario"; // é»˜è®¤ä½¿ç”¨åŸå§‹æ¨¡å¼
+
+    cfg.steps = 2000;
+
+    if (mode == "scenario") {
+        return runScenarioMode(cfg);
+    } else if (mode == "legacy") {
+        return runLegacy(cfg);
+    } else {
+        std::cerr << "Unknown mode: " << mode << std::endl;
+        std::cerr << "Valid modes: legacy, scenario" << std::endl;
+        printUsage(argv[0]);
+        return 1;
+    }
 }
