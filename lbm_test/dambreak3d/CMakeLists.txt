@@ -1,5 +1,5 @@
-# apps/dambreak3d/CMakeLists.txt
-# Dam Break 3D Standalone Example
+# lbm_test/dambreak3d/CMakeLists.txt
+# Dam Break 3D Scenario
 
 add_executable(dambreak3d
   main.cu
@@ -7,11 +7,11 @@ add_executable(dambreak3d
 
 target_include_directories(dambreak3d PRIVATE
   ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_SOURCE_DIR}/lbm_test/common
 )
 
 target_link_libraries(dambreak3d PRIVATE
-  physics
-  services
+  lbm_test_common
 )
 
 set_target_properties(dambreak3d PROPERTIES

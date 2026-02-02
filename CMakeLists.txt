@@ -78,8 +78,8 @@ target_link_libraries(services PUBLIC
 )
 
 # ------------------------------------------------------------------------------
-# Apps
+# LBM test cases
 # ------------------------------------------------------------------------------
 if(BUILD_APPS)
-  add_subdirectory(apps/dambreak3d)
+  add_subdirectory(lbm_test)
 endif()
