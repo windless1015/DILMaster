@@ -1,7 +1,11 @@
 #include <cuda_runtime.h>
 #include <cstdlib>
 
+#include <filesystem>
+#include <iostream>
 #include "ScenarioRunner.hpp"
+
+namespace fs = std::filesystem;
 
 int main(int argc, char **argv) {
   lbm::LBMConfig config{};
@@ -26,6 +30,12 @@ int main(int argc, char **argv) {
   scenario.config = config;
   scenario.steps = steps;
   scenario.output_interval = 200;
+  scenario.output_dir = "hydrostatic_output";
+  
+  if (!fs::exists(scenario.output_dir)) {
+      fs::create_directories(scenario.output_dir);
+      std::cout << "Created output directory: " << scenario.output_dir << std::endl;
+  }
   scenario.prepareGeometry = [config](lbm::FreeSurfaceModule &fs) {
     fs.setRegion(0, config.nx - 1, 0, config.ny - 1, 0, config.nz - 1,
                  lbm::CellType::GAS, 0.0f, config.rho0);

@@ -391,7 +391,7 @@ int main(int argc, char** argv) {
     DamBreak3DConfig cfg;
     std::string mode = "scenario"; // 默认使用 scenario 模式
 
-    cfg.steps = 2000;
+    cfg.steps = 10000;
     
     // Default output dir (relative to CWD)
     // If user wants it in build/.../dambreak3d_output, they should run from there OR we can try to detect.
