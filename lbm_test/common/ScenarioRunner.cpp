@@ -91,9 +91,13 @@ void runScenario(const ScenarioConfig &spec) {
   solver.initialize(ctx);
 
   // prepareGeometry 回调设置初始几何
+  // 注意：不调用 refreshDistributions()。初始分布函数在 LBMCore::initialize() 中
+  // 已设为 f_eq(rho0, u0)，对所有单元一致。setRegion 只修改 flags/phi/mass，
+  // 自由表面模块会在前几步自然调整界面处的分布函数。
+  // 若调用 refreshDistributions()，kernel_initialize() 会按 flags 重新初始化分布，
+  // 可能将 GAS 单元清零或按 phi 缩放 INTERFACE 单元，破坏初始平衡。
   if (spec.prepareGeometry && fsPtr) {
     spec.prepareGeometry(*fsPtr);
-    solver.getCore()->refreshDistributions();
   }
 
   // VTK output (optional, enabled when output_dir is non-empty)
@@ -120,9 +124,27 @@ void runScenario(const ScenarioConfig &spec) {
                                               h_flags.data(), h_phi.data());
   double initialMass = calculateTotalMass(h_phi.data(), h_flags.data(), nCells, cfg.rho0);
   printStatus(0, h_flags.data(), nCells, initialMass, initialMass);
+  // Write initial state VTK
+  if (vtkService) {
+    {
+      auto handle = fieldStore.get("flags");
+      std::memcpy(handle.data(), h_flags.data(), nCells * sizeof(uint8_t));
+    }
+    {
+      auto velHandle = fieldStore.get("fluid.velocity");
+      auto vtkHandle = fieldStore.get("velocity");
+      // Note: h_u is already in host memory, we can copy from there or from fieldStore
+      // fieldStore "fluid.velocity" (if allocated on host) might not be populated yet if we only did download_fields into local h_u
+      // But allocate() created fieldStore entries with device pointers.
+      // vtkHandle is host-only alias.
+      // We should copy from h_u to vtkHandle.
+      std::memcpy(vtkHandle.data(), h_u.data(), nCells * 3 * sizeof(float));
+    }
+    vtkService->onStepEnd(ctx);
+  }
 
   for (int step = 1; step <= spec.steps; ++step) {
-    ctx.step = step;
+    ctx.step = step - 1; // LBMCore internal step starts at 0
     ctx.time = step * spec.dt;
     solver.step(ctx); // step() 内部会同步 GPU → FieldStore 主机缓冲区
 
@@ -134,6 +156,13 @@ void runScenario(const ScenarioConfig &spec) {
       const float *phiPtr = phiHandle.as<float>();
 
       double currentMass = calculateTotalMass(phiPtr, flagsPtr, nCells, cfg.rho0);
+      
+      // Temporarily sync ctx.step with user-facing 'step' for output
+      // This ensures:
+      // 1. VTKService interval check passes (e.g. 100 % 100 == 0)
+      // 2. Output filename uses user-facing step count (step_000100.vti)
+      ctx.step = step;
+      
       printStatus(step, flagsPtr, nCells, currentMass, initialMass);
 
       // Update VTK alias fields and write
@@ -149,6 +178,11 @@ void runScenario(const ScenarioConfig &spec) {
         }
         vtkService->onStepEnd(ctx);
       }
+      
+      // Restore physics step logic if we were continuing inside the loop
+      // (not strictly necessary here as ctx.step is overwritten at top of loop, 
+      // but good practice if code is added after)
+      ctx.step = step - 1; 
     }
   }
 

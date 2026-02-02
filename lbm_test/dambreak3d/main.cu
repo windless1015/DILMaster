@@ -56,6 +56,13 @@ struct DamBreak3DConfig {
 // ============================================================================
 // 辅助函数
 // ============================================================================
+static void ensureOutputDir(const std::string& path) {
+    if (!fs::exists(path)) {
+        fs::create_directories(path);
+        std::cout << "Created output directory: " << path << std::endl;
+    }
+}
+
 static double calculateTotalMass(const std::vector<float>& phi,
     const std::vector<unsigned char>& flags,
     int nCells, float rho0) {
@@ -320,6 +327,7 @@ static int runScenarioMode(const DamBreak3DConfig& cfg) {
     lbmConfig.u0 = make_float3(0.0f, 0.0f, 0.0f);
     lbmConfig.gravity =
         make_float3(cfg.gravity[0], cfg.gravity[1], cfg.gravity[2]);
+
     lbmConfig.sigma = cfg.sigma;
     lbmConfig.wallFlags = lbm::WALL_ALL;
     lbmConfig.enableFreeSurface = true;
@@ -384,7 +392,11 @@ int main(int argc, char** argv) {
     std::string mode = "scenario"; // 默认使用 scenario 模式
 
     cfg.steps = 2000;
-
+    
+    // Default output dir (relative to CWD)
+    // If user wants it in build/.../dambreak3d_output, they should run from there OR we can try to detect.
+    // However, explicitly creating it ensures it exists regardless of CWD.
+    
     // 解析命令行参数
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -401,6 +413,8 @@ int main(int argc, char** argv) {
         }
     }
 
+    ensureOutputDir(cfg.output_dir);
+    
     if (mode == "scenario") {
         return runScenarioMode(cfg);
     } else if (mode == "legacy") {

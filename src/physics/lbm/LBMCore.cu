@@ -41,6 +41,7 @@ void LBMCore::allocateMemory() {
   p.fx = config_.gravity.x;
   p.fy = config_.gravity.y;
   p.fz = config_.gravity.z;
+  printf("[LBMCore::allocateMemory] Gravity=(%f, %f, %f), tau=%f, nu=%f\n", p.fx, p.fy, p.fz, tau, nu);
   p.sigma = config_.sigma;
   p.w = 1.0f / (3.0f * p.nu + 0.5f);
   p.def_6_sigma = 6.0f * config_.sigma;
