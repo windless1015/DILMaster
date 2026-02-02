@@ -4,6 +4,7 @@
 #include "ILBMModule.hpp"
 #include "LBMConfig.hpp"
 #include "LBMMemoryManager.hpp"
+#include "cuda/LBMBackend.hpp"
 #include <cstdint>
 
 namespace lbm {
@@ -27,6 +28,9 @@ public:
   void preStream(StepContext &ctx) override;
   void postStream(StepContext &ctx) override;
   void finalize() override;
+
+  // 绑定 CUDA 后端（必须在 initialize 之前调用）
+  void setBackend(CudaLBMBackend *backend) { backend_ = backend; }
 
   // Configuration
   bool isEnabled() const { return enabled_; }
@@ -75,6 +79,7 @@ private:
   float rho0_;
   int wallFlags_;
   LBMMemoryManager *memMgr_;
+  CudaLBMBackend *backend_;
 
   // Shared buffers (owned by core)
   BufferHandle flagsHandle_;

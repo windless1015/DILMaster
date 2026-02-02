@@ -36,6 +36,10 @@ public:
   void initialize();
   void step();
 
+  // === 分阶段步进（供模块钩子使用）===
+  void streamCollide();      // 仅执行 streaming + collision
+  void updateMacroscopic();  // 更新宏观场 + 打包速度 + 同步 + stepCount++
+
   // === 运行时配置 ===
   void setExternalForce(float3 force);
   void setCollisionModel(CollisionModel model);

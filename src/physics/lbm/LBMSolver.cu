@@ -50,32 +50,26 @@ void LBMSolver::step(StepContext &ctx) {
   if (!core_)
     return;
 
-  // Call all modules' preStream
+  // [COUPLING FIX] Apply external forces from FieldStore if available
+  if (ctx.fields && ctx.fields->exists("fluid.force")) {
+      auto forceHandle = ctx.fields->get("fluid.force");
+      const float* forceHost = forceHandle.as<float>();
+      if (core_) core_->uploadExternalForce(forceHost);
+  }
+
+  // 分阶段步进：preStream → streamCollide → postStream → updateMacroscopic
+  // 确保自由表面内核在 streaming 和宏观更新之间正确执行
   for (auto &module : modules_) {
     module->preStream(ctx);
   }
 
-  // Execute LBM step
-  // Execute LBM step
-  
-  // [COUPLING FIX] Apply external forces from FieldStore if available
-  if (ctx.fields && ctx.fields->exists("fluid.force")) {
-      auto forceHandle = ctx.fields->get("fluid.force");
-      // Check for Device pointer support (future) or Host pointer (legacy)
-      // Currently FieldStore only supports Host std::vector
-      const float* forceHost = forceHandle.as<float>();
-      
-      // Upload to GPU
-      // TODO: optimize this to avoid H2D transfer if possible (requires FieldStore GPU support)
-      if (core_) core_->uploadExternalForce(forceHost);
-  }
+  core_->streamCollide();
 
-  core_->step();
-
-  // Call all modules' postStream
   for (auto &module : modules_) {
     module->postStream(ctx);
   }
+
+  core_->updateMacroscopic();
 }
 
 void LBMSolver::finalize(StepContext &ctx) {

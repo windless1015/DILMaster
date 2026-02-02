@@ -112,6 +112,7 @@ int main(int argc, char **argv) {
   // ------------------------------------------------------------------
   lbm::FreeSurfaceModule fsModule;
   fsModule.configure(lbmConfig);
+  fsModule.setBackend(&lbmCore.backend());
   fsModule.allocate(memMgr);
   fsModule.initialize();
 
@@ -254,8 +255,11 @@ int main(int argc, char **argv) {
                 << std::noshowpos << "%)" << std::endl;
     }
 
-    // LBM 步进
-    lbmCore.step();
+    // LBM 步进（分阶段，自由表面钩子插入 streaming 和宏观更新之间）
+    fsModule.preStream(ctx);         // 1. 捕获出站分布
+    lbmCore.streamCollide();         // 2. Streaming + Collision
+    fsModule.postStream(ctx);        // 3-5. 质量交换 + 标志转换 + Phi重计算
+    lbmCore.updateMacroscopic();     // 6. 更新宏观场 + 打包 + 同步
 
     // 健康检查
     if (!lbmCore.checkHealth()) {

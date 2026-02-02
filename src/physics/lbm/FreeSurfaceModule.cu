@@ -128,8 +128,8 @@ __global__ void apply_walls_kernel(int nx, int ny, int nz, int wallFlags,
 
 FreeSurfaceModule::FreeSurfaceModule()
     : enabled_(false), nx_(0), ny_(0), nz_(0), nCells_(0), rho0_(1.0f),
-      wallFlags_(0), memMgr_(nullptr), flagsHandle_{}, phiHandle_{},
-      massHandle_{}, cellTypeHandle_{}, massDifferenceHandle_{},
+      wallFlags_(0), memMgr_(nullptr), backend_(nullptr), flagsHandle_{},
+      phiHandle_{}, massHandle_{}, cellTypeHandle_{}, massDifferenceHandle_{},
       d_toFluid_(nullptr), d_toEmpty_(nullptr), d_toInterface_(nullptr),
       d_massExcess_(nullptr), d_interfaceCount_(nullptr) {}
 
@@ -161,11 +161,46 @@ void FreeSurfaceModule::allocate(LBMMemoryManager &memMgr) {
         memMgr_->allocate(BufferHandle::Type::CUSTOM, 4u, sizeof(double),
                           BufferHandle::Layout::SoA, "fs.massDifference");
   }
+
+  // 注册自由表面特有的后端缓冲区到 MemoryManager
+  // 需要 backend_ 已初始化（即 setBackend 已调用且后端已分配内存）
+  if (backend_ && backend_->is_initialized()) {
+    const size_t n = static_cast<size_t>(nCells_);
+    memMgr_->registerExternal(BufferHandle::Type::PHI, backend_->phi_device(),
+                              n, sizeof(float), BufferHandle::Layout::SoA,
+                              "lbm.phi");
+    memMgr_->registerExternal(BufferHandle::Type::MASS, backend_->mass_device(),
+                              n, sizeof(float), BufferHandle::Layout::SoA,
+                              "lbm.mass");
+    memMgr_->registerExternal(BufferHandle::Type::MASS_EXCESS,
+                              backend_->massex_device(), n, sizeof(float),
+                              BufferHandle::Layout::SoA, "lbm.massex");
+  }
 }
 
 void FreeSurfaceModule::initialize() {
   if (!memMgr_)
     return;
+
+  // 若 allocate 时后端尚未就绪，在此补注册自由表面缓冲区
+  if (backend_ && backend_->is_initialized()) {
+    const size_t n = static_cast<size_t>(nCells_);
+    if (!memMgr_->getBuffer(BufferHandle::Type::PHI).isValid()) {
+      memMgr_->registerExternal(BufferHandle::Type::PHI, backend_->phi_device(),
+                                n, sizeof(float), BufferHandle::Layout::SoA,
+                                "lbm.phi");
+    }
+    if (!memMgr_->getBuffer(BufferHandle::Type::MASS).isValid()) {
+      memMgr_->registerExternal(BufferHandle::Type::MASS,
+                                backend_->mass_device(), n, sizeof(float),
+                                BufferHandle::Layout::SoA, "lbm.mass");
+    }
+    if (!memMgr_->getBuffer(BufferHandle::Type::MASS_EXCESS).isValid()) {
+      memMgr_->registerExternal(BufferHandle::Type::MASS_EXCESS,
+                                backend_->massex_device(), n, sizeof(float),
+                                BufferHandle::Layout::SoA, "lbm.massex");
+    }
+  }
 
   flagsHandle_ = memMgr_->getBuffer(BufferHandle::Type::FLAGS);
   phiHandle_ = memMgr_->getBuffer(BufferHandle::Type::PHI);
@@ -181,8 +216,21 @@ void FreeSurfaceModule::initialize() {
   }
 }
 
-void FreeSurfaceModule::preStream(StepContext & /*ctx*/) {}
-void FreeSurfaceModule::postStream(StepContext & /*ctx*/) {}
+void FreeSurfaceModule::preStream(StepContext &ctx) {
+  if (!enabled_ || !backend_)
+    return;
+  // 捕获出站分布（用于质量交换），必须在 streaming 之前执行
+  backend_->kernel_surface_capture_outgoing((unsigned long long)ctx.step);
+}
+
+void FreeSurfaceModule::postStream(StepContext &ctx) {
+  if (!enabled_ || !backend_)
+    return;
+  // streaming 之后、update_fields 之前，按物理顺序执行自由表面内核
+  backend_->kernel_surface_mass_exchange();
+  backend_->kernel_surface_flag_transition((unsigned long long)ctx.step);
+  backend_->kernel_surface_phi_recompute();
+}
 
 void FreeSurfaceModule::finalize() {
   if (memMgr_) {

@@ -78,15 +78,6 @@ void LBMCore::allocateMemory() {
     memMgr_->registerExternal(BufferHandle::Type::FLAGS, backend_.flags_device(),
                               n, sizeof(uint8_t), BufferHandle::Layout::SoA,
                               "lbm.flags");
-    memMgr_->registerExternal(BufferHandle::Type::PHI, backend_.phi_device(),
-                              n, sizeof(float), BufferHandle::Layout::SoA,
-                              "lbm.phi");
-    memMgr_->registerExternal(BufferHandle::Type::MASS, backend_.mass_device(),
-                              n, sizeof(float), BufferHandle::Layout::SoA,
-                              "lbm.mass");
-    memMgr_->registerExternal(BufferHandle::Type::MASS_EXCESS,
-                              backend_.massex_device(), n, sizeof(float),
-                              BufferHandle::Layout::SoA, "lbm.massex");
     if (backend_.force_device() != nullptr) {
       memMgr_->registerExternal(BufferHandle::Type::FORCE,
                                 backend_.force_device(), n,
@@ -162,28 +153,18 @@ void LBMCore::step() {
   if (!initialized_)
     initialize();
 
-  // Free Surface 处理流程 (可选，基于 enableFreeSurface)
-  // 1. 捕获出站分布（用于质量交换）
-  backend_.kernel_surface_capture_outgoing((unsigned long long)stepCount_);
+  // 基础流动计算（不含自由表面逻辑）
+  streamCollide();
+  updateMacroscopic();
+}
 
-  // 2. Streaming + Collision
+void LBMCore::streamCollide() {
   backend_.kernel_stream_collide((unsigned long long)stepCount_);
+}
 
-  // 3. 质量交换
-  backend_.kernel_surface_mass_exchange();
-
-  // 4. 标志转换
-  backend_.kernel_surface_flag_transition((unsigned long long)stepCount_);
-
-  // 5. Phi 重计算
-  backend_.kernel_surface_phi_recompute();
-
-  // 6. 更新宏观场
+void LBMCore::updateMacroscopic() {
   backend_.kernel_update_fields((unsigned long long)stepCount_);
-
-  // 7. 打包速度到 AoS
   packVelocityAoS();
-
   backend_.synchronize();
   stepCount_++;
 }
