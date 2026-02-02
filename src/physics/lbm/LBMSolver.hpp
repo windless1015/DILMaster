@@ -2,7 +2,7 @@
 /**
  * @file LBMSolver.hpp
  * @brief LBM Solver with complete configuration interface
- * 
+ *
  * IMPORTANT: This solver accepts LBMConfig directly. All parameters should be
  * set in the config struct. DO NOT add new setter methods here - instead,
  * add new fields to LBMConfig.hpp if needed.
@@ -11,7 +11,6 @@
 #include "../ISolver.hpp"
 #include "LBMConfig.hpp"
 #include "ILBMModule.hpp"
-#include "LBMMemoryManager.hpp"
 #include <memory>
 #include <vector>
 
@@ -26,14 +25,14 @@ public:
   ~LBMSolver() override;
 
   std::string name() const override { return "LBM"; }
-  
+
   // =========================================================================
   // Configuration Interface - Use ONE of these methods
   // =========================================================================
-  
+
   /**
    * @brief Set complete LBM configuration (RECOMMENDED)
-   * 
+   *
    * Example usage:
    * @code
    * lbm::LBMConfig cfg;
@@ -47,10 +46,10 @@ public:
    * @endcode
    */
   void setConfig(const lbm::LBMConfig& config);
-  
+
   /**
    * @brief Get mutable reference to config for modification
-   * 
+   *
    * Note: Call this BEFORE allocate() to ensure changes take effect.
    */
   lbm::LBMConfig& config() { return config_; }
@@ -76,9 +75,6 @@ public:
   lbm::LBMCore *getCore() { return core_.get(); }
   const lbm::LBMCore *getCore() const { return core_.get(); }
 
-  lbm::LBMMemoryManager *getMemoryManager() { return memMgr_.get(); }
-  const lbm::LBMMemoryManager *getMemoryManager() const { return memMgr_.get(); }
-  
   std::size_t getNx() const { return static_cast<std::size_t>(config_.nx); }
   std::size_t getNy() const { return static_cast<std::size_t>(config_.ny); }
   std::size_t getNz() const { return static_cast<std::size_t>(config_.nz); }
@@ -91,8 +87,9 @@ public:
   }
 
 private:
+  void syncFieldsToHost(StepContext &ctx);
+
   lbm::LBMConfig config_;
-  std::unique_ptr<lbm::LBMMemoryManager> memMgr_;
   std::unique_ptr<lbm::LBMCore> core_;
   std::vector<std::unique_ptr<ILBMModule>> modules_;
 };

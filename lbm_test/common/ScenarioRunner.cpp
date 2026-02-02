@@ -14,10 +14,10 @@ constexpr uint8_t TYPE_LIQUID = 0x08;
 constexpr uint8_t TYPE_INTERFACE = 0x10;
 constexpr uint8_t TYPE_GAS = 0x20;
 
-double calculateTotalMass(const std::vector<float> &phi,
-                          const std::vector<uint8_t> &flags, float rho0) {
+double calculateTotalMass(const float *phi, const uint8_t *flags,
+                          size_t nCells, float rho0) {
   double mass = 0.0;
-  for (size_t i = 0; i < flags.size(); ++i) {
+  for (size_t i = 0; i < nCells; ++i) {
     if (flags[i] == TYPE_LIQUID || flags[i] == TYPE_INTERFACE) {
       mass += static_cast<double>(phi[i]) * rho0;
     }
@@ -25,19 +25,19 @@ double calculateTotalMass(const std::vector<float> &phi,
   return mass;
 }
 
-void printStatus(int step, const std::vector<uint8_t> &flags, double mass,
+void printStatus(int step, const uint8_t *flags, size_t nCells, double mass,
                  double initialMass) {
   int liquid = 0;
-  int interface = 0;
+  int interface_ = 0;
   int gas = 0;
   int solid = 0;
-  for (auto flag : flags) {
-    switch (flag) {
+  for (size_t i = 0; i < nCells; ++i) {
+    switch (flags[i]) {
     case TYPE_LIQUID:
       ++liquid;
       break;
     case TYPE_INTERFACE:
-      ++interface;
+      ++interface_;
       break;
     case TYPE_GAS:
       ++gas;
@@ -55,7 +55,7 @@ void printStatus(int step, const std::vector<uint8_t> &flags, double mass,
                            : 0.0;
 
   std::cout << "Step " << std::setw(6) << step << ": L=" << liquid
-            << " I=" << interface << " G=" << gas << "  Mass="
+            << " I=" << interface_ << " G=" << gas << "  Mass="
             << std::fixed << std::setprecision(4) << mass << " ("
             << std::showpos << std::setprecision(3) << diffPercent
             << std::noshowpos << "%)" << std::endl;
@@ -81,22 +81,18 @@ void runScenario(const ScenarioConfig &spec) {
   ctx.dt = spec.dt;
 
   FieldStore fieldStore;
+  // VTK 用的别名字段（VTKService 期望 "flags" 和 "velocity"）
   fieldStore.create(FieldDesc{"flags", nCells, sizeof(uint8_t)});
   fieldStore.create(FieldDesc{"velocity", nCells * 3, sizeof(float)});
   ctx.fields = &fieldStore;
 
+  // allocate() 会在 FieldStore 中创建 fluid.* 字段并初始化 LBMCore
   solver.allocate(ctx);
   solver.initialize(ctx);
 
-  // Wire up FreeSurfaceModule's backend (required for setRegion to work:
-  // without it, PHI/MASS handles remain null and setRegion silently no-ops)
-  if (fsPtr) {
-    fsPtr->setBackend(&solver.getCore()->backend());
-    fsPtr->initialize(); // re-initialize to register PHI/MASS buffers
-  }
-
+  // prepareGeometry 回调设置初始几何
   if (spec.prepareGeometry && fsPtr) {
-    spec.prepareGeometry(*fsPtr, *solver.getMemoryManager());
+    spec.prepareGeometry(*fsPtr);
     solver.getCore()->refreshDistributions();
   }
 
@@ -114,39 +110,42 @@ void runScenario(const ScenarioConfig &spec) {
     vtkService->initialize(ctx);
   }
 
+  // 读取初始状态（通过 backend 下载，因为还没执行 step）
   std::vector<float> h_rho(nCells);
   std::vector<float> h_u(nCells * 3);
   std::vector<uint8_t> h_flags(nCells);
   std::vector<float> h_phi(nCells);
 
-  auto download_fields = [&]() {
-    solver.getCore()->backend().download_fields(h_rho.data(), h_u.data(),
-                                                h_flags.data(), h_phi.data());
-  };
-
-  download_fields();
-  double initialMass = calculateTotalMass(h_phi, h_flags, cfg.rho0);
-  printStatus(0, h_flags, initialMass, initialMass);
+  solver.getCore()->backend().download_fields(h_rho.data(), h_u.data(),
+                                              h_flags.data(), h_phi.data());
+  double initialMass = calculateTotalMass(h_phi.data(), h_flags.data(), nCells, cfg.rho0);
+  printStatus(0, h_flags.data(), nCells, initialMass, initialMass);
 
   for (int step = 1; step <= spec.steps; ++step) {
     ctx.step = step;
     ctx.time = step * spec.dt;
-    solver.step(ctx);
+    solver.step(ctx); // step() 内部会同步 GPU → FieldStore 主机缓冲区
 
     if (step % spec.output_interval == 0 || step == spec.steps) {
-      download_fields();
-      double currentMass = calculateTotalMass(h_phi, h_flags, cfg.rho0);
-      printStatus(step, h_flags, currentMass, initialMass);
+      // solver.step() 已将数据同步到 FieldStore，直接读取
+      auto flagsHandle = fieldStore.get("fluid.flags");
+      auto phiHandle = fieldStore.get("fluid.phi");
+      const uint8_t *flagsPtr = flagsHandle.as<uint8_t>();
+      const float *phiPtr = phiHandle.as<float>();
 
-      // Update FieldStore and write VTK
+      double currentMass = calculateTotalMass(phiPtr, flagsPtr, nCells, cfg.rho0);
+      printStatus(step, flagsPtr, nCells, currentMass, initialMass);
+
+      // Update VTK alias fields and write
       if (vtkService) {
         {
           auto handle = fieldStore.get("flags");
-          std::memcpy(handle.data(), h_flags.data(), nCells * sizeof(uint8_t));
+          std::memcpy(handle.data(), flagsPtr, nCells * sizeof(uint8_t));
         }
         {
-          auto handle = fieldStore.get("velocity");
-          std::memcpy(handle.data(), h_u.data(), nCells * 3 * sizeof(float));
+          auto velHandle = fieldStore.get("fluid.velocity");
+          auto vtkHandle = fieldStore.get("velocity");
+          std::memcpy(vtkHandle.data(), velHandle.data(), nCells * 3 * sizeof(float));
         }
         vtkService->onStepEnd(ctx);
       }

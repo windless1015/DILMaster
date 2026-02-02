@@ -26,8 +26,7 @@ int main(int argc, char **argv) {
   scenario.config = config;
   scenario.steps = steps;
   scenario.output_interval = 200;
-  scenario.prepareGeometry = [config](lbm::FreeSurfaceModule &fs,
-                                       lbm::LBMMemoryManager &) {
+  scenario.prepareGeometry = [config](lbm::FreeSurfaceModule &fs) {
     fs.setRegion(0, config.nx - 1, 0, config.ny - 1, 0, config.nz - 1,
                  lbm::CellType::GAS, 0.0f, config.rho0);
     const int water_x = config.nx / 2;

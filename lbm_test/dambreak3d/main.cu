@@ -21,7 +21,6 @@
 #include "physics/lbm/FreeSurfaceModule.hpp"
 #include "physics/lbm/LBMConfig.hpp"
 #include "physics/lbm/LBMCore.hpp"
-#include "physics/lbm/LBMMemoryManager.hpp"
 #include "services/VTKService.hpp"
 
 // ScenarioRunner 标准化路径
@@ -63,7 +62,7 @@ static double calculateTotalMass(const std::vector<float>& phi,
     double totalMass = 0.0;
     for (int i = 0; i < nCells; ++i) {
         // TYPE_F=0x08 (Liquid), TYPE_I=0x10 (Interface)
-        if (flags[i] == 0x08 || flags[i] == 0x10) { 
+        if (flags[i] == 0x08 || flags[i] == 0x10) {
             totalMass += phi[i] * rho0;
         }
     }
@@ -100,22 +99,41 @@ static int runLegacy(const DamBreak3DConfig& cfg) {
     std::cout << "sigma = " << cfg.sigma << std::endl;
 
     // ------------------------------------------------------------------
-    // 创建核心与内存
+    // 创建 LBMCore（不再需要 LBMMemoryManager）
     // ------------------------------------------------------------------
-    lbm::LBMMemoryManager memMgr;
-    lbm::LBMCore lbmCore(lbmConfig, &memMgr);
+    lbm::LBMCore lbmCore(lbmConfig);
     lbmCore.initialize();
 
     const int nCells = cfg.nx * cfg.ny * cfg.nz;
 
     // ------------------------------------------------------------------
-    // 自由表面模块：设置初始几何
+    // 创建 FieldStore 并注册 fluid 字段（带 device pointer）
+    // ------------------------------------------------------------------
+    FieldStore fieldStore;
+    const size_t n = static_cast<size_t>(nCells);
+    fieldStore.create(FieldDesc{"fluid.density",  n,     sizeof(float),
+                                 lbmCore.densityDevicePtr()});
+    fieldStore.create(FieldDesc{"fluid.velocity", n * 3, sizeof(float),
+                                 lbmCore.velocityDevicePtr()});
+    fieldStore.create(FieldDesc{"fluid.flags",    n,     sizeof(uint8_t),
+                                 lbmCore.flagsDevicePtr()});
+    fieldStore.create(FieldDesc{"fluid.phi",      n,     sizeof(float),
+                                 lbmCore.phiDevicePtr()});
+    fieldStore.create(FieldDesc{"fluid.mass",     n,     sizeof(float),
+                                 lbmCore.massDevicePtr()});
+    // VTK 用的别名字段
+    fieldStore.create(
+        FieldDesc{ "flags", static_cast<size_t>(nCells), sizeof(unsigned char) });
+    fieldStore.create(
+        FieldDesc{ "velocity", static_cast<size_t>(nCells * 3), sizeof(float) });
+
+    // ------------------------------------------------------------------
+    // 自由表面模块：配置 + 分配 + 初始化
     // ------------------------------------------------------------------
     lbm::FreeSurfaceModule fsModule;
     fsModule.configure(lbmConfig);
-    fsModule.setBackend(&lbmCore.backend());
-    fsModule.allocate(memMgr);
-    fsModule.initialize();
+    fsModule.allocate(fieldStore);
+    fsModule.initialize(fieldStore);
 
     // 1) 全域设为 GAS
     fsModule.setRegion(0, cfg.nx - 1, 0, cfg.ny - 1, 0, cfg.nz - 1,
@@ -134,15 +152,6 @@ static int runLegacy(const DamBreak3DConfig& cfg) {
     fsModule.fixInterfaceLayer();
 
     // ------------------------------------------------------------------
-    // FieldStore（为 VTKService 提供数据）
-    // ------------------------------------------------------------------
-    FieldStore fieldStore;
-    fieldStore.create(
-        FieldDesc{ "flags", static_cast<size_t>(nCells), sizeof(unsigned char) });
-    fieldStore.create(
-        FieldDesc{ "velocity", static_cast<size_t>(nCells * 3), sizeof(float) });
-
-    // ------------------------------------------------------------------
     // VTKService 配置
     // ------------------------------------------------------------------
     VTKService::Config vtkConfig;
@@ -159,6 +168,7 @@ static int runLegacy(const DamBreak3DConfig& cfg) {
     ctx.time = 0.0;
     ctx.dt = 1.0;
     ctx.fields = &fieldStore;
+    ctx.backend = &lbmCore.backend(); // 模块通过 ctx.backend 访问后端
     vtkService.initialize(ctx);
 
     // ------------------------------------------------------------------
@@ -212,13 +222,13 @@ static int runLegacy(const DamBreak3DConfig& cfg) {
             lbmCore.backend().download_fields(h_rho.data(), h_u.data(),
                 h_flags.data(), h_phi.data());
 
-            // 更新 FieldStore 中的 flags
+            // 更新 FieldStore 中的 flags (VTK 别名)
             {
                 auto handle = fieldStore.get("flags");
                 memcpy(handle.data(), h_flags.data(),
                     nCells * sizeof(unsigned char));
             }
-            // 更新 FieldStore 中的 velocity (SoA 原样写入)
+            // 更新 FieldStore 中的 velocity (VTK 别名)
             {
                 auto handle = fieldStore.get("velocity");
                 memcpy(handle.data(), h_u.data(), nCells * 3 * sizeof(float));
@@ -334,8 +344,7 @@ static int runScenarioMode(const DamBreak3DConfig& cfg) {
 
     // 通过 prepareGeometry 回调设置初始几何
     scenario.prepareGeometry =
-        [&cfg, water_y, water_z](lbm::FreeSurfaceModule& fs,
-                                  lbm::LBMMemoryManager& /*memMgr*/) {
+        [&cfg, water_y, water_z](lbm::FreeSurfaceModule& fs) {
             // 1) 全域设为 GAS
             fs.setRegion(0, cfg.nx - 1, 0, cfg.ny - 1, 0, cfg.nz - 1,
                 lbm::CellType::GAS, 0.0f, cfg.rho0);
@@ -372,9 +381,25 @@ static void printUsage(const char* progName) {
 // ============================================================================
 int main(int argc, char** argv) {
     DamBreak3DConfig cfg;
-    std::string mode = "scenario"; // 默认使用原始模式
+    std::string mode = "scenario"; // 默认使用 scenario 模式
 
     cfg.steps = 2000;
+
+    // 解析命令行参数
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "--mode") && i + 1 < argc) {
+            mode = argv[++i];
+        } else if ((arg == "--steps") && i + 1 < argc) {
+            cfg.steps = std::atoi(argv[++i]);
+        } else if (arg == "-h" || arg == "--help") {
+            printUsage(argv[0]);
+            return 0;
+        } else {
+            // 兼容旧行为: 无名参数视为 steps
+            cfg.steps = std::atoi(argv[i]);
+        }
+    }
 
     if (mode == "scenario") {
         return runScenarioMode(cfg);

@@ -1,11 +1,12 @@
 #pragma once
 
-#include "BufferHandle.hpp"
 #include "ILBMModule.hpp"
 #include "LBMConfig.hpp"
-#include "LBMMemoryManager.hpp"
 #include "cuda/LBMBackend.hpp"
 #include <cstdint>
+
+// 前向声明
+class FieldStore;
 
 namespace lbm {
 
@@ -23,14 +24,11 @@ public:
 
   // ILBMModule lifecycle
   void configure(const LBMConfig &config) override;
-  void allocate(LBMMemoryManager &memMgr) override;
-  void initialize() override;
+  void allocate(FieldStore &fields) override;
+  void initialize(FieldStore &fields) override;
   void preStream(StepContext &ctx) override;
   void postStream(StepContext &ctx) override;
   void finalize() override;
-
-  // 绑定 CUDA 后端（必须在 initialize 之前调用）
-  void setBackend(CudaLBMBackend *backend) { backend_ = backend; }
 
   // Configuration
   bool isEnabled() const { return enabled_; }
@@ -72,30 +70,19 @@ public:
   bool checkHealth();
 
 private:
-  void clearHandles();
-
   bool enabled_;
   int nx_, ny_, nz_, nCells_;
   float rho0_;
   int wallFlags_;
-  LBMMemoryManager *memMgr_;
-  CudaLBMBackend *backend_;
 
-  // Shared buffers (owned by core)
-  BufferHandle flagsHandle_;
-  BufferHandle phiHandle_;
-  BufferHandle massHandle_;
+  // 设备指针：从 FieldStore 获取（非拥有）
+  uint8_t *d_flags_ = nullptr;   // "fluid.flags"
+  float *d_phi_ = nullptr;       // "fluid.phi"
+  float *d_mass_ = nullptr;      // "fluid.mass"
 
-  // Module-owned buffers
-  BufferHandle cellTypeHandle_;
-  BufferHandle massDifferenceHandle_;
-
-  // Unused legacy placeholders (future implementation)
-  uint8_t *d_toFluid_;
-  uint8_t *d_toEmpty_;
-  uint8_t *d_toInterface_;
-  float *d_massExcess_;
-  int *d_interfaceCount_;
+  // 模块自有的 GPU 缓冲区（通过 cudaMalloc 分配）
+  uint8_t *d_cellType_ = nullptr;    // fs.cellType
+  double *d_massDiff_ = nullptr;     // fs.massDifference
 };
 
 } // namespace lbm

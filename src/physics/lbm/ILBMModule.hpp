@@ -2,7 +2,9 @@
 
 #include "../../core/StepContext.hpp"
 #include "LBMConfig.hpp"
-#include "LBMMemoryManager.hpp"
+
+// 前向声明
+class FieldStore;
 
 // LBM 求解器的可插拔模块接口
 class ILBMModule {
@@ -11,8 +13,8 @@ public:
 
   // 生命周期：配置 + 分配 + 初始化
   virtual void configure(const lbm::LBMConfig &config) = 0;
-  virtual void allocate(lbm::LBMMemoryManager &memMgr) = 0;
-  virtual void initialize() = 0;
+  virtual void allocate(FieldStore &fields) = 0;
+  virtual void initialize(FieldStore &fields) = 0;
 
   // LBM streaming/collision 前后钩子
   virtual void preStream(StepContext &ctx) = 0;

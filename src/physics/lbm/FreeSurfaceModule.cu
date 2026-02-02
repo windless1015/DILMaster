@@ -1,4 +1,5 @@
 #include "FreeSurfaceModule.hpp"
+#include "../../core/FieldStore.hpp"
 #include "cuda/cuda_utils.hpp"
 #include <cuda_runtime.h>
 
@@ -128,10 +129,7 @@ __global__ void apply_walls_kernel(int nx, int ny, int nz, int wallFlags,
 
 FreeSurfaceModule::FreeSurfaceModule()
     : enabled_(false), nx_(0), ny_(0), nz_(0), nCells_(0), rho0_(1.0f),
-      wallFlags_(0), memMgr_(nullptr), backend_(nullptr), flagsHandle_{},
-      phiHandle_{}, massHandle_{}, cellTypeHandle_{}, massDifferenceHandle_{},
-      d_toFluid_(nullptr), d_toEmpty_(nullptr), d_toInterface_(nullptr),
-      d_massExcess_(nullptr), d_interfaceCount_(nullptr) {}
+      wallFlags_(0) {}
 
 FreeSurfaceModule::~FreeSurfaceModule() { finalize(); }
 
@@ -145,126 +143,94 @@ void FreeSurfaceModule::configure(const LBMConfig &config) {
   enabled_ = config.enableFreeSurface;
 }
 
-void FreeSurfaceModule::allocate(LBMMemoryManager &memMgr) {
-  memMgr_ = &memMgr;
+void FreeSurfaceModule::allocate(FieldStore &fields) {
   if (nCells_ <= 0)
     return;
 
-  if (!cellTypeHandle_.isValid()) {
-    cellTypeHandle_ =
-        memMgr_->allocate(BufferHandle::Type::CUSTOM, (size_t)nCells_,
-                          sizeof(uint8_t), BufferHandle::Layout::SoA,
-                          "fs.cellType");
+  // 分配模块自有的 GPU 缓冲区
+  if (!d_cellType_) {
+    CUDA_CHECK(cudaMalloc(&d_cellType_, sizeof(uint8_t) * (size_t)nCells_));
   }
-  if (!massDifferenceHandle_.isValid()) {
-    massDifferenceHandle_ =
-        memMgr_->allocate(BufferHandle::Type::CUSTOM, 4u, sizeof(double),
-                          BufferHandle::Layout::SoA, "fs.massDifference");
+  if (!d_massDiff_) {
+    CUDA_CHECK(cudaMalloc(&d_massDiff_, sizeof(double) * 4));
   }
 
-  // 注册自由表面特有的后端缓冲区到 MemoryManager
-  // 需要 backend_ 已初始化（即 setBackend 已调用且后端已分配内存）
-  if (backend_ && backend_->is_initialized()) {
-    const size_t n = static_cast<size_t>(nCells_);
-    memMgr_->registerExternal(BufferHandle::Type::PHI, backend_->phi_device(),
-                              n, sizeof(float), BufferHandle::Layout::SoA,
-                              "lbm.phi");
-    memMgr_->registerExternal(BufferHandle::Type::MASS, backend_->mass_device(),
-                              n, sizeof(float), BufferHandle::Layout::SoA,
-                              "lbm.mass");
-    memMgr_->registerExternal(BufferHandle::Type::MASS_EXCESS,
-                              backend_->massex_device(), n, sizeof(float),
-                              BufferHandle::Layout::SoA, "lbm.massex");
-  }
+  // 注册到 FieldStore（带 device pointer）
+  fields.create(FieldDesc{"fs.cellType", (size_t)nCells_, sizeof(uint8_t), d_cellType_});
+  fields.create(FieldDesc{"fs.massDifference", 4, sizeof(double), d_massDiff_});
 }
 
-void FreeSurfaceModule::initialize() {
-  if (!memMgr_)
-    return;
-
-  // 若 allocate 时后端尚未就绪，在此补注册自由表面缓冲区
-  if (backend_ && backend_->is_initialized()) {
-    const size_t n = static_cast<size_t>(nCells_);
-    if (!memMgr_->getBuffer(BufferHandle::Type::PHI).isValid()) {
-      memMgr_->registerExternal(BufferHandle::Type::PHI, backend_->phi_device(),
-                                n, sizeof(float), BufferHandle::Layout::SoA,
-                                "lbm.phi");
-    }
-    if (!memMgr_->getBuffer(BufferHandle::Type::MASS).isValid()) {
-      memMgr_->registerExternal(BufferHandle::Type::MASS,
-                                backend_->mass_device(), n, sizeof(float),
-                                BufferHandle::Layout::SoA, "lbm.mass");
-    }
-    if (!memMgr_->getBuffer(BufferHandle::Type::MASS_EXCESS).isValid()) {
-      memMgr_->registerExternal(BufferHandle::Type::MASS_EXCESS,
-                                backend_->massex_device(), n, sizeof(float),
-                                BufferHandle::Layout::SoA, "lbm.massex");
-    }
+void FreeSurfaceModule::initialize(FieldStore &fields) {
+  // 从 FieldStore 获取 fluid 字段的设备指针
+  if (fields.exists("fluid.flags")) {
+    d_flags_ = fields.get("fluid.flags").device_as<uint8_t>();
+  }
+  if (fields.exists("fluid.phi")) {
+    d_phi_ = fields.get("fluid.phi").device_as<float>();
+  }
+  if (fields.exists("fluid.mass")) {
+    d_mass_ = fields.get("fluid.mass").device_as<float>();
   }
 
-  flagsHandle_ = memMgr_->getBuffer(BufferHandle::Type::FLAGS);
-  phiHandle_ = memMgr_->getBuffer(BufferHandle::Type::PHI);
-  massHandle_ = memMgr_->getBuffer(BufferHandle::Type::MASS);
-
-  if (cellTypeHandle_.isValid()) {
-    CUDA_CHECK(cudaMemset(cellTypeHandle_.getDevicePtr(), 0,
-                          cellTypeHandle_.getTotalBytes()));
+  // 清零自有缓冲区
+  if (d_cellType_) {
+    CUDA_CHECK(cudaMemset(d_cellType_, 0, sizeof(uint8_t) * (size_t)nCells_));
   }
-  if (massDifferenceHandle_.isValid()) {
-    CUDA_CHECK(cudaMemset(massDifferenceHandle_.getDevicePtr(), 0,
-                          massDifferenceHandle_.getTotalBytes()));
+  if (d_massDiff_) {
+    CUDA_CHECK(cudaMemset(d_massDiff_, 0, sizeof(double) * 4));
   }
 }
 
 void FreeSurfaceModule::preStream(StepContext &ctx) {
-  if (!enabled_ || !backend_)
+  if (!enabled_)
+    return;
+  auto *be = static_cast<CudaLBMBackend *>(ctx.backend);
+  if (!be)
     return;
   // 捕获出站分布（用于质量交换），必须在 streaming 之前执行
-  backend_->kernel_surface_capture_outgoing((unsigned long long)ctx.step);
+  be->kernel_surface_capture_outgoing((unsigned long long)ctx.step);
 }
 
 void FreeSurfaceModule::postStream(StepContext &ctx) {
-  if (!enabled_ || !backend_)
+  if (!enabled_)
+    return;
+  auto *be = static_cast<CudaLBMBackend *>(ctx.backend);
+  if (!be)
     return;
   // streaming 之后、update_fields 之前，按物理顺序执行自由表面内核
-  backend_->kernel_surface_mass_exchange();
-  backend_->kernel_surface_flag_transition((unsigned long long)ctx.step);
-  backend_->kernel_surface_phi_recompute();
+  be->kernel_surface_mass_exchange();
+  be->kernel_surface_flag_transition((unsigned long long)ctx.step);
+  be->kernel_surface_phi_recompute();
 }
 
 void FreeSurfaceModule::finalize() {
-  if (memMgr_) {
-    if (cellTypeHandle_.isValid())
-      memMgr_->deallocate(cellTypeHandle_);
-    if (massDifferenceHandle_.isValid())
-      memMgr_->deallocate(massDifferenceHandle_);
+  if (d_cellType_) {
+    cudaFree(d_cellType_);
+    d_cellType_ = nullptr;
   }
-  clearHandles();
-  memMgr_ = nullptr;
+  if (d_massDiff_) {
+    cudaFree(d_massDiff_);
+    d_massDiff_ = nullptr;
+  }
+  d_flags_ = nullptr;
+  d_phi_ = nullptr;
+  d_mass_ = nullptr;
 }
 
 uint8_t *FreeSurfaceModule::getCellType() const {
-  return static_cast<uint8_t *>(cellTypeHandle_.getDevicePtr());
+  return d_cellType_;
 }
 
 float *FreeSurfaceModule::getFill() const {
-  return static_cast<float *>(phiHandle_.getDevicePtr());
+  return d_phi_;
 }
 
 float *FreeSurfaceModule::getMass() const {
-  return static_cast<float *>(massHandle_.getDevicePtr());
+  return d_mass_;
 }
 
 double *FreeSurfaceModule::getMassDifference() const {
-  return static_cast<double *>(massDifferenceHandle_.getDevicePtr());
-}
-
-void FreeSurfaceModule::clearHandles() {
-  flagsHandle_ = BufferHandle{};
-  phiHandle_ = BufferHandle{};
-  massHandle_ = BufferHandle{};
-  cellTypeHandle_ = BufferHandle{};
-  massDifferenceHandle_ = BufferHandle{};
+  return d_massDiff_;
 }
 
 void FreeSurfaceModule::initFlatSurface(float level, float rho0) {
@@ -275,43 +241,33 @@ void FreeSurfaceModule::initFlatSurface(float level, float rho0) {
 void FreeSurfaceModule::setRegion(int x0, int x1, int y0, int y1, int z0,
                                   int z1, CellType type, float fill,
                                   float rho0) {
-  uint8_t *cellType = getCellType();
-  float *phi = getFill();
-  float *mass = getMass();
-  uint8_t *flags = static_cast<uint8_t *>(flagsHandle_.getDevicePtr());
-
-  if (cellType == nullptr || phi == nullptr || mass == nullptr ||
-      flags == nullptr)
+  if (d_cellType_ == nullptr || d_phi_ == nullptr || d_mass_ == nullptr ||
+      d_flags_ == nullptr)
     return;
 
   const dim3 block(256);
   const dim3 grid((unsigned int)((nCells_ + block.x - 1) / block.x));
 
   set_region_kernel<<<grid, block>>>(nx_, ny_, nz_, x0, x1, y0, y1, z0, z1,
-                                     (uint8_t)type, fill, rho0, cellType,
-                                     flags, phi, mass);
+                                     (uint8_t)type, fill, rho0, d_cellType_,
+                                     d_flags_, d_phi_, d_mass_);
   CUDA_CHECK(cudaGetLastError());
 }
 
 void FreeSurfaceModule::fixInterfaceLayer() {
-  uint8_t *cellType = getCellType();
-  float *phi = getFill();
-  float *mass = getMass();
-  uint8_t *flags = static_cast<uint8_t *>(flagsHandle_.getDevicePtr());
-
-  if (cellType == nullptr || phi == nullptr || mass == nullptr ||
-      flags == nullptr)
+  if (d_cellType_ == nullptr || d_phi_ == nullptr || d_mass_ == nullptr ||
+      d_flags_ == nullptr)
     return;
 
   const dim3 block(256);
   const dim3 grid((unsigned int)((nCells_ + block.x - 1) / block.x));
 
-  fix_interface_kernel<<<grid, block>>>(nx_, ny_, nz_, rho0_, cellType, flags,
-                                        phi, mass);
+  fix_interface_kernel<<<grid, block>>>(nx_, ny_, nz_, rho0_, d_cellType_,
+                                        d_flags_, d_phi_, d_mass_);
   CUDA_CHECK(cudaGetLastError());
 
   apply_walls_kernel<<<grid, block>>>(nx_, ny_, nz_, wallFlags_, rho0_,
-                                      cellType, flags, phi, mass);
+                                      d_cellType_, d_flags_, d_phi_, d_mass_);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -336,9 +292,9 @@ void FreeSurfaceModule::reconstructInterface(float *f, const float3 *u_field) {
 bool FreeSurfaceModule::checkHealth() {
   if (!enabled_)
     return true;
-  return cellTypeHandle_.isValid() && massDifferenceHandle_.isValid() &&
-         flagsHandle_.isValid() && phiHandle_.isValid() &&
-         massHandle_.isValid();
+  return d_cellType_ != nullptr && d_massDiff_ != nullptr &&
+         d_flags_ != nullptr && d_phi_ != nullptr &&
+         d_mass_ != nullptr;
 }
 
 } // namespace lbm

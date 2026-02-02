@@ -37,7 +37,6 @@ set(LBM_SOURCES
   src/physics/lbm/LBMSolver.cu
   src/physics/lbm/LBMCore.cu
   src/physics/lbm/FreeSurfaceModule.cu
-  src/physics/lbm/LBMMemoryManager.cu
   src/physics/lbm/cuda/LBMBackend.cu
   src/physics/lbm/cuda/LBMKernels.cu
   src/physics/lbm/cuda/LBMDeviceConstants.cu

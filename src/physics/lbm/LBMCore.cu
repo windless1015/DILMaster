@@ -19,13 +19,7 @@ __global__ void pack_velocity_kernel(const float *u_in, float3 *u_out,
 
 LBMCore::LBMCore(const LBMConfig &config)
     : config_(config), nCells_(config.nx * config.ny * config.nz),
-      stepCount_(0), initialized_(false), u_aos_(nullptr), memMgr_(nullptr),
-      buffersRegistered_(false) {}
-
-LBMCore::LBMCore(const LBMConfig &config, LBMMemoryManager *memMgr)
-    : config_(config), nCells_(config.nx * config.ny * config.nz),
-      stepCount_(0), initialized_(false), u_aos_(nullptr), memMgr_(memMgr),
-      buffersRegistered_(false) {}
+      stepCount_(0), initialized_(false), u_aos_(nullptr) {}
 
 LBMCore::~LBMCore() { freeMemory(); }
 
@@ -66,26 +60,6 @@ void LBMCore::allocateMemory() {
 
   // 加载设备常量
   dev_const::loadConstants(config_.gravity);
-
-  if (memMgr_ != nullptr && !buffersRegistered_) {
-    const size_t n = static_cast<size_t>(nCells_);
-    memMgr_->registerExternal(BufferHandle::Type::DENSITY, backend_.rho_device(),
-                              n, sizeof(float), BufferHandle::Layout::SoA,
-                              "lbm.rho");
-    memMgr_->registerExternal(BufferHandle::Type::VELOCITY, backend_.u_device(),
-                              n, sizeof(float) * 3u,
-                              BufferHandle::Layout::SoA, "lbm.u");
-    memMgr_->registerExternal(BufferHandle::Type::FLAGS, backend_.flags_device(),
-                              n, sizeof(uint8_t), BufferHandle::Layout::SoA,
-                              "lbm.flags");
-    if (backend_.force_device() != nullptr) {
-      memMgr_->registerExternal(BufferHandle::Type::FORCE,
-                                backend_.force_device(), n,
-                                sizeof(float) * 3u,
-                                BufferHandle::Layout::SoA, "lbm.force");
-    }
-    buffersRegistered_ = true;
-  }
 }
 
 void LBMCore::freeMemory() {
@@ -111,7 +85,7 @@ void LBMCore::initialize() {
     u_host[n + i] = config_.u0.y;
     u_host[2u * n + i] = config_.u0.z;
   }
-  
+
   // Cell flags: FLUID for single-phase, GAS for free-surface initial state
   uint8_t default_flag = config_.enableFreeSurface ? cuda::CellFlag::GAS : cuda::CellFlag::FLUID;
   std::vector<uint8_t> flags_host(n, default_flag);
@@ -180,19 +154,18 @@ void LBMCore::uploadExternalForce(const float *force_host) {
       backend_.upload_force(nullptr);
       return;
   }
-  
+
   // AoS (Host) -> SoA (Host Temp)
-  // Assuming force_host is compact array of floats [fx, fy, fz, fx, fy, fz...]
   const size_t n = static_cast<size_t>(nCells_);
   std::vector<float> force_soa(n * 3);
-  
+
   #pragma omp parallel for
-  for(long long i=0; i<n; ++i) {
+  for(long long i=0; i<(long long)n; ++i) {
       force_soa[i] = force_host[i*3 + 0];
       force_soa[n + i] = force_host[i*3 + 1];
       force_soa[2*n + i] = force_host[i*3 + 2];
   }
-  
+
   backend_.upload_force(force_soa.data());
 }
 
@@ -201,12 +174,6 @@ void LBMCore::setExternalForceFromDeviceAoS(const float3 *force_device_aos) {
          backend_.upload_force(nullptr);
          return;
     }
-    // Need backend support to convert AoS (Device) to SoA (Device)
-    // We can add a helper in backend for this.
-    // For now, let's assume valid internal access or add method to backend.
-    
-    // Direct access to backend's internal SoA buffer if we had it exposed...
-    // Better: add `upload_force_from_device_aos` to CudaLBMBackend.
     backend_.upload_force_from_device_aos(force_device_aos);
 }
 

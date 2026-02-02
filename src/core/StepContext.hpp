@@ -14,6 +14,7 @@ struct StepContext {
   double time = 0.0;            // 当前模拟时间
   double dt = 0.001;            // 当前时间步长
   FieldStore *fields = nullptr; // 字段存储指针
+  void *backend = nullptr;      // 可选的计算后端指针（如 CudaLBMBackend*）
 
   // 便捷构造函数
   StepContext() = default;
