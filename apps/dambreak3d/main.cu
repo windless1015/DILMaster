@@ -1,0 +1,293 @@
+/**
+ * dambreak3d - Dam Break 3D Simulation (DILMaster Standalone)
+ *
+ * 使用 LBMCore + FreeSurfaceModule 直接驱动自由表面溃坝模拟。
+ * 输出 VTI 文件 (flags + velocity)，可在 ParaView 中可视化。
+ */
+#include <cuda_runtime.h>
+#include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#include "core/FieldStore.hpp"
+#include "core/StepContext.hpp"
+#include "physics/lbm/FreeSurfaceModule.hpp"
+#include "physics/lbm/LBMConfig.hpp"
+#include "physics/lbm/LBMCore.hpp"
+#include "physics/lbm/LBMMemoryManager.hpp"
+#include "services/VTKService.hpp"
+
+namespace fs = std::filesystem;
+
+// ============================================================================
+// 配置
+// ============================================================================
+struct DamBreak3DConfig {
+  // 网格尺寸
+  int nx = 64;
+  int ny = 96;
+  int nz = 96;
+
+  // 物理参数
+  float nu = 0.005f;
+  float gravity[3] = {0.0f, 0.0f, -0.0002f};
+  float sigma = 0.0001f;
+  float rho0 = 1.0f;
+
+  // 初始水柱范围 (比例)
+  float water_z_ratio = 6.0f / 8.0f; // z 方向水位高度
+  float water_y_ratio = 1.0f / 8.0f; // y 方向水柱宽度
+
+  // 模拟控制
+  int steps = 20000;
+  std::string output_dir = "dambreak3d_output/";
+  int output_interval = 100;
+};
+
+// ============================================================================
+// 辅助函数
+// ============================================================================
+static double calculateTotalMass(const std::vector<float> &phi,
+                                 const std::vector<unsigned char> &flags,
+                                 int nCells, float rho0) {
+  double totalMass = 0.0;
+  for (int i = 0; i < nCells; ++i) {
+    // TYPE_F=0x08 (Liquid), TYPE_I=0x10 (Interface)
+    if (flags[i] == 0x08 || flags[i] == 0x10) {
+      totalMass += phi[i] * rho0;
+    }
+  }
+  return totalMass;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+int main(int argc, char **argv) {
+  std::cout << "=== DILMaster Dam Break 3D ===" << std::endl;
+
+  DamBreak3DConfig cfg;
+
+  // 允许命令行覆盖步数
+  if (argc > 1) {
+    cfg.steps = std::atoi(argv[1]);
+  }
+
+  // ------------------------------------------------------------------
+  // 构建 LBM 配置
+  // ------------------------------------------------------------------
+  lbm::LBMConfig lbmConfig{};
+  lbmConfig.nx = cfg.nx;
+  lbmConfig.ny = cfg.ny;
+  lbmConfig.nz = cfg.nz;
+  lbmConfig.tau = 3.0f * cfg.nu + 0.5f;
+  lbmConfig.rho0 = cfg.rho0;
+  lbmConfig.u0 = make_float3(0.0f, 0.0f, 0.0f);
+  lbmConfig.gravity =
+      make_float3(cfg.gravity[0], cfg.gravity[1], cfg.gravity[2]);
+  lbmConfig.sigma = cfg.sigma;
+  lbmConfig.wallFlags = lbm::WALL_ALL;
+  lbmConfig.enableFreeSurface = true;
+
+  std::cout << "Grid: " << cfg.nx << " x " << cfg.ny << " x " << cfg.nz
+            << std::endl;
+  std::cout << "nu = " << cfg.nu << ", tau = " << lbmConfig.tau << std::endl;
+  std::cout << "gravity = (" << cfg.gravity[0] << ", " << cfg.gravity[1]
+            << ", " << cfg.gravity[2] << ")" << std::endl;
+  std::cout << "sigma = " << cfg.sigma << std::endl;
+
+  // ------------------------------------------------------------------
+  // 创建求解器组件
+  // ------------------------------------------------------------------
+  lbm::LBMMemoryManager memMgr;
+  lbm::LBMCore lbmCore(lbmConfig, &memMgr);
+  lbmCore.initialize();
+
+  const int nCells = cfg.nx * cfg.ny * cfg.nz;
+
+  // ------------------------------------------------------------------
+  // 自由表面模块：设置初始几何
+  // ------------------------------------------------------------------
+  lbm::FreeSurfaceModule fsModule;
+  fsModule.configure(lbmConfig);
+  fsModule.allocate(memMgr);
+  fsModule.initialize();
+
+  // 1) 全域设为 GAS
+  fsModule.setRegion(0, cfg.nx - 1, 0, cfg.ny - 1, 0, cfg.nz - 1,
+                     lbm::CellType::GAS, 0.0f, cfg.rho0);
+
+  // 2) 水柱区域设为 LIQUID
+  const int water_z = static_cast<int>(cfg.nz * cfg.water_z_ratio);
+  const int water_y = static_cast<int>(cfg.ny * cfg.water_y_ratio);
+  std::cout << "Water block: x=[0," << cfg.nx - 1 << "], y=[0," << water_y - 1
+            << "], z=[0," << water_z - 1 << "]" << std::endl;
+
+  fsModule.setRegion(0, cfg.nx - 1, 0, water_y - 1, 0, water_z - 1,
+                     lbm::CellType::LIQUID, 1.0f, cfg.rho0);
+
+  // 3) 修正界面层
+  fsModule.fixInterfaceLayer();
+
+  // ------------------------------------------------------------------
+  // FieldStore：为 VTKService 提供数据
+  //   - "flags"    : uint8, nCells 个元素 → 通过 fields 列表输出
+  //   - "velocity" : float, nCells*3 (SoA) → VTKService 特殊处理
+  // ------------------------------------------------------------------
+  FieldStore fieldStore;
+  fieldStore.create(
+      FieldDesc{"flags", static_cast<size_t>(nCells), sizeof(unsigned char)});
+  fieldStore.create(
+      FieldDesc{"velocity", static_cast<size_t>(nCells * 3), sizeof(float)});
+
+  // ------------------------------------------------------------------
+  // VTKService 配置
+  // ------------------------------------------------------------------
+  VTKService::Config vtkConfig;
+  vtkConfig.output_dir = cfg.output_dir;
+  vtkConfig.interval = cfg.output_interval;
+  vtkConfig.fields = {"flags"}; // flags 走通用标量路径
+  // velocity 由 VTKService 内部自动检测 "velocity" 字段输出 (SoA→交错)
+  vtkConfig.nx = cfg.nx;
+  vtkConfig.ny = cfg.ny;
+  vtkConfig.nz = cfg.nz;
+  VTKService vtkService(vtkConfig);
+
+  StepContext ctx;
+  ctx.step = 0;
+  ctx.time = 0.0;
+  ctx.dt = 1.0;
+  ctx.fields = &fieldStore;
+  vtkService.initialize(ctx);
+
+  // ------------------------------------------------------------------
+  // 主机缓冲区
+  // ------------------------------------------------------------------
+  std::vector<unsigned char> h_flags(nCells);
+  std::vector<float> h_phi(nCells);
+  std::vector<float> h_rho(nCells);
+  std::vector<float> h_u(nCells * 3);
+
+  // 下载初始场并统计
+  lbmCore.backend().download_fields(h_rho.data(), h_u.data(), h_flags.data(),
+                                    h_phi.data());
+  const double initialMass =
+      calculateTotalMass(h_phi, h_flags, nCells, cfg.rho0);
+
+  int initLiquid = 0, initInterface = 0, initGas = 0, initSolid = 0;
+  for (int i = 0; i < nCells; ++i) {
+    if (h_flags[i] == 0x08)
+      initLiquid++;
+    else if (h_flags[i] == 0x10)
+      initInterface++;
+    else if (h_flags[i] == 0x20)
+      initGas++;
+    else if (h_flags[i] == 0x01)
+      initSolid++;
+  }
+
+  std::cout << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << "Initial State:" << std::endl;
+  std::cout << "  Liquid: " << initLiquid << ", Interface: " << initInterface
+            << ", Gas: " << initGas << ", Solid: " << initSolid << std::endl;
+  std::cout << "  Total Mass: " << std::fixed << std::setprecision(6)
+            << initialMass << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << std::endl;
+
+  // ------------------------------------------------------------------
+  // 模拟主循环
+  // ------------------------------------------------------------------
+  std::cout << "Starting simulation for " << cfg.steps << " steps..."
+            << std::endl;
+
+  for (int step = 0; step <= cfg.steps; ++step) {
+    ctx.step = step;
+    ctx.time = step * ctx.dt;
+
+    if (step % cfg.output_interval == 0) {
+      // GPU → Host
+      lbmCore.backend().download_fields(h_rho.data(), h_u.data(),
+                                        h_flags.data(), h_phi.data());
+
+      // 更新 FieldStore 中的 flags
+      {
+        auto handle = fieldStore.get("flags");
+        memcpy(handle.data(), h_flags.data(),
+               nCells * sizeof(unsigned char));
+      }
+      // 更新 FieldStore 中的 velocity (SoA 原样写入)
+      {
+        auto handle = fieldStore.get("velocity");
+        memcpy(handle.data(), h_u.data(), nCells * 3 * sizeof(float));
+      }
+
+      // 写 VTI 文件
+      vtkService.onStepEnd(ctx);
+
+      // 控制台统计
+      double currentMass =
+          calculateTotalMass(h_phi, h_flags, nCells, cfg.rho0);
+      double massDiffPercent =
+          (initialMass > 0)
+              ? ((currentMass - initialMass) / initialMass * 100.0)
+              : 0.0;
+
+      int liquidCells = 0, interfaceCells = 0, gasCells = 0;
+      for (int i = 0; i < nCells; ++i) {
+        if (h_flags[i] == 0x08)
+          liquidCells++;
+        else if (h_flags[i] == 0x10)
+          interfaceCells++;
+        else if (h_flags[i] == 0x20)
+          gasCells++;
+      }
+
+      std::cout << "Step " << std::setw(6) << step
+                << ": L=" << liquidCells << " I=" << interfaceCells
+                << " G=" << gasCells << "  Mass=" << std::fixed
+                << std::setprecision(4) << currentMass << " ("
+                << std::showpos << std::setprecision(3) << massDiffPercent
+                << std::noshowpos << "%)" << std::endl;
+    }
+
+    // LBM 步进
+    lbmCore.step();
+
+    // 健康检查
+    if (!lbmCore.checkHealth()) {
+      std::cerr << "[FAIL] Simulation exploded at step " << step << std::endl;
+      break;
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 最终报告
+  // ------------------------------------------------------------------
+  vtkService.finalize(ctx);
+
+  lbmCore.backend().download_fields(h_rho.data(), h_u.data(), h_flags.data(),
+                                    h_phi.data());
+  double finalMass = calculateTotalMass(h_phi, h_flags, nCells, cfg.rho0);
+
+  std::cout << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << "FINAL MASS REPORT:" << std::endl;
+  std::cout << "  Initial: " << std::fixed << std::setprecision(6)
+            << initialMass << std::endl;
+  std::cout << "  Final:   " << finalMass << std::endl;
+  std::cout << "  Diff:    " << std::showpos << (finalMass - initialMass)
+            << std::noshowpos << " (" << std::showpos << std::setprecision(4)
+            << ((initialMass > 0)
+                    ? ((finalMass - initialMass) / initialMass * 100.0)
+                    : 0.0)
+            << std::noshowpos << "%)" << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << "=== Simulation Complete ===" << std::endl;
+  std::cout << "VTI files written to: " << cfg.output_dir << std::endl;
+
+  return 0;
+}

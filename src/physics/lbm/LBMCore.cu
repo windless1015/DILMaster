@@ -1,0 +1,259 @@
+#include "LBMCore.hpp"
+#include "cuda/LBMDeviceConstants.cuh"
+#include "cuda/cuda_utils.hpp"
+#include <cuda_runtime.h>
+#include <vector>
+
+namespace lbm {
+
+namespace {
+__global__ void pack_velocity_kernel(const float *u_in, float3 *u_out,
+                                     int nCells) {
+  const int n = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (n >= nCells)
+    return;
+  const int N = nCells;
+  u_out[n] = make_float3(u_in[n], u_in[N + n], u_in[2 * N + n]);
+}
+} // namespace
+
+LBMCore::LBMCore(const LBMConfig &config)
+    : config_(config), nCells_(config.nx * config.ny * config.nz),
+      stepCount_(0), initialized_(false), u_aos_(nullptr), memMgr_(nullptr),
+      buffersRegistered_(false) {}
+
+LBMCore::LBMCore(const LBMConfig &config, LBMMemoryManager *memMgr)
+    : config_(config), nCells_(config.nx * config.ny * config.nz),
+      stepCount_(0), initialized_(false), u_aos_(nullptr), memMgr_(memMgr),
+      buffersRegistered_(false) {}
+
+LBMCore::~LBMCore() { freeMemory(); }
+
+void LBMCore::allocateMemory() {
+  if (initialized_)
+    return;
+
+  // 计算 tau 和 nu
+  const float tau = config_.tau > 0.0f ? config_.tau : (1.0f / 3.0f + 0.5f);
+  const float nu = (tau - 0.5f) / 3.0f;
+
+  // 设置 CUDA 后端参数 (使用新的 LBMParams 结构)
+  cuda::LBMParams p{};
+  p.Nx = (unsigned int)config_.nx;
+  p.Ny = (unsigned int)config_.ny;
+  p.Nz = (unsigned int)config_.nz;
+  p.N = (unsigned long long)nCells_;
+  p.nu = nu;
+  p.fx = config_.gravity.x;
+  p.fy = config_.gravity.y;
+  p.fz = config_.gravity.z;
+  p.sigma = config_.sigma;
+  p.w = 1.0f / (3.0f * p.nu + 0.5f);
+  p.def_6_sigma = 6.0f * config_.sigma;
+
+  // 从 LBMConfig 同步碰撞模型和自由表面设置
+  p.collisionModel = static_cast<cuda::CollisionModel>(
+      static_cast<int>(config_.collisionModel));
+  p.enableFreeSurface = config_.enableFreeSurface;
+
+  // 初始化 CUDA 后端
+  backend_.initialize(p);
+
+  // 分配 AoS 速度缓冲区
+  if (u_aos_ == nullptr) {
+    CUDA_CHECK(cudaMalloc(&u_aos_, sizeof(float3) * (size_t)nCells_));
+  }
+
+  // 加载设备常量
+  dev_const::loadConstants(config_.gravity);
+
+  if (memMgr_ != nullptr && !buffersRegistered_) {
+    const size_t n = static_cast<size_t>(nCells_);
+    memMgr_->registerExternal(BufferHandle::Type::DENSITY, backend_.rho_device(),
+                              n, sizeof(float), BufferHandle::Layout::SoA,
+                              "lbm.rho");
+    memMgr_->registerExternal(BufferHandle::Type::VELOCITY, backend_.u_device(),
+                              n, sizeof(float) * 3u,
+                              BufferHandle::Layout::SoA, "lbm.u");
+    memMgr_->registerExternal(BufferHandle::Type::FLAGS, backend_.flags_device(),
+                              n, sizeof(uint8_t), BufferHandle::Layout::SoA,
+                              "lbm.flags");
+    memMgr_->registerExternal(BufferHandle::Type::PHI, backend_.phi_device(),
+                              n, sizeof(float), BufferHandle::Layout::SoA,
+                              "lbm.phi");
+    memMgr_->registerExternal(BufferHandle::Type::MASS, backend_.mass_device(),
+                              n, sizeof(float), BufferHandle::Layout::SoA,
+                              "lbm.mass");
+    memMgr_->registerExternal(BufferHandle::Type::MASS_EXCESS,
+                              backend_.massex_device(), n, sizeof(float),
+                              BufferHandle::Layout::SoA, "lbm.massex");
+    if (backend_.force_device() != nullptr) {
+      memMgr_->registerExternal(BufferHandle::Type::FORCE,
+                                backend_.force_device(), n,
+                                sizeof(float) * 3u,
+                                BufferHandle::Layout::SoA, "lbm.force");
+    }
+    buffersRegistered_ = true;
+  }
+}
+
+void LBMCore::freeMemory() {
+  if (u_aos_) {
+    cudaFree(u_aos_);
+    u_aos_ = nullptr;
+  }
+  initialized_ = false;
+}
+
+void LBMCore::initialize() {
+  if (initialized_)
+    return;
+  allocateMemory();
+
+  const size_t n = static_cast<size_t>(nCells_);
+
+  // 准备主机端初始数据
+  std::vector<float> rho_host(n, config_.rho0);
+  std::vector<float> u_host(n * 3u, 0.0f);
+  for (size_t i = 0u; i < n; i++) {
+    u_host[i] = config_.u0.x;
+    u_host[n + i] = config_.u0.y;
+    u_host[2u * n + i] = config_.u0.z;
+  }
+  
+  // Cell flags: FLUID for single-phase, GAS for free-surface initial state
+  uint8_t default_flag = config_.enableFreeSurface ? cuda::CellFlag::GAS : cuda::CellFlag::FLUID;
+  std::vector<uint8_t> flags_host(n, default_flag);
+  std::vector<float> phi_host(n, config_.enableFreeSurface ? 0.0f : 1.0f);
+
+  // 上传到设备
+  backend_.upload_host_fields(rho_host.data(), u_host.data(), flags_host.data(),
+                              phi_host.data());
+
+  // 初始化分布函数
+  backend_.kernel_initialize();
+  backend_.synchronize();
+
+  // 打包速度到 AoS 格式
+  packVelocityAoS();
+
+  initialized_ = true;
+}
+
+void LBMCore::refreshDistributions() {
+  if (!backend_.is_initialized())
+    return;
+  backend_.kernel_initialize();
+  packVelocityAoS();
+  backend_.synchronize();
+}
+
+void LBMCore::packVelocityAoS() {
+  if (u_aos_ == nullptr)
+    return;
+  const dim3 block(256);
+  const dim3 grid((unsigned int)((nCells_ + block.x - 1) / block.x));
+  const float *u_soa = backend_.u_device();
+  pack_velocity_kernel<<<grid, block>>>(u_soa, u_aos_, nCells_);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void LBMCore::step() {
+  if (!initialized_)
+    initialize();
+
+  // Free Surface 处理流程 (可选，基于 enableFreeSurface)
+  // 1. 捕获出站分布（用于质量交换）
+  backend_.kernel_surface_capture_outgoing((unsigned long long)stepCount_);
+
+  // 2. Streaming + Collision
+  backend_.kernel_stream_collide((unsigned long long)stepCount_);
+
+  // 3. 质量交换
+  backend_.kernel_surface_mass_exchange();
+
+  // 4. 标志转换
+  backend_.kernel_surface_flag_transition((unsigned long long)stepCount_);
+
+  // 5. Phi 重计算
+  backend_.kernel_surface_phi_recompute();
+
+  // 6. 更新宏观场
+  backend_.kernel_update_fields((unsigned long long)stepCount_);
+
+  // 7. 打包速度到 AoS
+  packVelocityAoS();
+
+  backend_.synchronize();
+  stepCount_++;
+}
+
+void LBMCore::setExternalForce(float3 force) {
+  config_.gravity = force;
+  dev_const::updateGravity(force);
+  backend_.set_force(force.x, force.y, force.z);
+}
+
+void LBMCore::uploadExternalForce(const float *force_host) {
+  if (!force_host) {
+      backend_.upload_force(nullptr);
+      return;
+  }
+  
+  // AoS (Host) -> SoA (Host Temp)
+  // Assuming force_host is compact array of floats [fx, fy, fz, fx, fy, fz...]
+  const size_t n = static_cast<size_t>(nCells_);
+  std::vector<float> force_soa(n * 3);
+  
+  #pragma omp parallel for
+  for(long long i=0; i<n; ++i) {
+      force_soa[i] = force_host[i*3 + 0];
+      force_soa[n + i] = force_host[i*3 + 1];
+      force_soa[2*n + i] = force_host[i*3 + 2];
+  }
+  
+  backend_.upload_force(force_soa.data());
+}
+
+void LBMCore::setExternalForceFromDeviceAoS(const float3 *force_device_aos) {
+    if (!force_device_aos) {
+         backend_.upload_force(nullptr);
+         return;
+    }
+    // Need backend support to convert AoS (Device) to SoA (Device)
+    // We can add a helper in backend for this.
+    // For now, let's assume valid internal access or add method to backend.
+    
+    // Direct access to backend's internal SoA buffer if we had it exposed...
+    // Better: add `upload_force_from_device_aos` to CudaLBMBackend.
+    backend_.upload_force_from_device_aos(force_device_aos);
+}
+
+void LBMCore::setCollisionModel(CollisionModel model) {
+  config_.collisionModel = model;
+  backend_.set_collision_model(
+      static_cast<cuda::CollisionModel>(static_cast<int>(model)));
+}
+
+void LBMCore::setFreeSurfaceEnabled(bool enabled) {
+  config_.enableFreeSurface = enabled;
+  backend_.set_free_surface_enabled(enabled);
+}
+
+const float *LBMCore::getDensityField() const { return backend_.rho_device(); }
+
+const float3 *LBMCore::getVelocityField() const { return u_aos_; }
+
+uint8_t *LBMCore::getFlagsDevice() const { return backend_.flags_device(); }
+
+float *LBMCore::getPhiDevice() const { return backend_.phi_device(); }
+
+float *LBMCore::getMassDevice() const { return backend_.mass_device(); }
+
+bool LBMCore::checkHealth() const {
+  return initialized_ && backend_.is_initialized();
+}
+
+void LBMCore::synchronize() const { backend_.synchronize(); }
+
+} // namespace lbm
