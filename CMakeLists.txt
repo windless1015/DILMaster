@@ -81,4 +81,5 @@ target_link_libraries(services PUBLIC
 # ------------------------------------------------------------------------------
 if(BUILD_APPS)
   add_subdirectory(lbm_test)
+  add_subdirectory(ib_test)
 endif()
