@@ -33,11 +33,13 @@ void LBMSolver::allocate(StepContext &ctx) {
   const size_t n = static_cast<size_t>(config_.nx) * config_.ny * config_.nz;
 
   // 在 FieldStore 中注册 fluid 字段（带 device pointer）
+  // 注意：velocity 使用 AoS (float3) 格式，方便外部耦合模块使用
   if (ctx.fields) {
     ctx.fields->create(FieldDesc{"fluid.density",  n,     sizeof(float),
                                   core_->densityDevicePtr()});
-    ctx.fields->create(FieldDesc{"fluid.velocity", n * 3, sizeof(float),
-                                  core_->velocityDevicePtr()});
+    // velocity: 使用 AoS 格式 (float3*)，元素数量为 n，每个元素 sizeof(float3)
+    ctx.fields->create(FieldDesc{"fluid.velocity", n, sizeof(float3),
+                                  core_->velocityAoSPtr()});
     ctx.fields->create(FieldDesc{"fluid.flags",    n,     sizeof(uint8_t),
                                   core_->flagsDevicePtr()});
     ctx.fields->create(FieldDesc{"fluid.phi",      n,     sizeof(float),
@@ -46,6 +48,8 @@ void LBMSolver::allocate(StepContext &ctx) {
                                   core_->massDevicePtr()});
     ctx.fields->create(FieldDesc{"fluid.massex",   n,     sizeof(float),
                                   core_->massExDevicePtr()});
+
+    printf("[LBMSolver::allocate] core=%p u_aos=%p\n", core_.get(), core_->velocityAoSPtr());
   }
 
   // Module lifecycle: configure + allocate
@@ -87,6 +91,10 @@ void LBMSolver::step(StepContext &ctx) {
 
   core_->streamCollide();
 
+  if (ctx.step % 100 == 0) {
+      printf("[LBMSolver::step] core=%p u_aos=%p\n", core_.get(), core_->velocityAoSPtr());
+  }
+
   for (auto &module : modules_) {
     module->postStream(ctx);
   }
@@ -114,8 +122,9 @@ void LBMSolver::syncFieldsToHost(StepContext &ctx) {
   }
   if (ctx.fields->exists("fluid.velocity")) {
     auto h = ctx.fields->get("fluid.velocity");
-    cudaMemcpy(h.data(), core_->velocityDevicePtr(),
-               n * 3 * sizeof(float), cudaMemcpyDeviceToHost);
+    // velocity 使用 AoS (float3) 格式
+    cudaMemcpy(h.data(), core_->velocityAoSPtr(),
+               n * sizeof(float3), cudaMemcpyDeviceToHost);
   }
   if (ctx.fields->exists("fluid.flags")) {
     auto h = ctx.fields->get("fluid.flags");

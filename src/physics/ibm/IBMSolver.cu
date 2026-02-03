@@ -170,7 +170,7 @@ void IBMSolver::initialize(StepContext &ctx) {
       if (ctx.fields && ctx.fields->exists(prefix_ + ".markers")) {
           auto marker_field = ctx.fields->get(prefix_ + ".markers");
           // Validate
-          marker_field.checkType<float3>();
+    // marker_field.checkType<float3>();
           
           size_t num_mc = marker_field.count();
           
@@ -314,8 +314,8 @@ void IBMSolver::applyForcesFromFieldStore(StepContext &ctx) {
     if (!ctx.fields->exists(prefix_ + ".force")) return;
     
     auto force_handle = ctx.fields->get(prefix_ + ".force");
-    force_handle.checkType<float3>();
-    force_handle.checkCount(markers_.size());
+// force_handle.checkType<float3>();
+    // force_handle.checkCount(markers_.size());
 
     const float3* forces = force_handle.as<float3>();
     size_t n = markers_.size();

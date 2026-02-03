@@ -10,31 +10,51 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
+include(GoogleTest)
 
-# Define the test executable
+# ==============================================================================
+# Existing Test: IBM Fundamentals
+# ==============================================================================
 add_executable(test_ibm_fundamentals
     test_ibm_fundamentals.cu
 )
 
-# Enable CUDA language for the target (though project enables it globally)
 set_target_properties(test_ibm_fundamentals PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
-
-# Include directories
-# We need to access src/physics/ibm/IBMKernel.h
 target_include_directories(test_ibm_fundamentals PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
-# Enable C++17
 target_compile_features(test_ibm_fundamentals PRIVATE cxx_std_17)
 
-# Link GTest
 target_link_libraries(test_ibm_fundamentals PRIVATE 
     GTest::gtest 
     GTest::gtest_main
 )
 
-# Add to CTest
-include(GoogleTest)
 gtest_discover_tests(test_ibm_fundamentals)
+
+# ==============================================================================
+# New Test: IBM MDF Regression
+# ==============================================================================
+add_executable(test_ibm_mdf
+    test_ibm_mdf.cu
+    ../src/physics/ibm/IBMCore.cu
+)
+
+set_target_properties(test_ibm_mdf PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+target_include_directories(test_ibm_mdf PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_compile_definitions(test_ibm_mdf PRIVATE IBM_TESTING)
+
+target_compile_features(test_ibm_mdf PRIVATE cxx_std_17)
+
+target_link_libraries(test_ibm_mdf PRIVATE 
+    GTest::gtest 
+    GTest::gtest_main
+)
+
+gtest_discover_tests(test_ibm_mdf)

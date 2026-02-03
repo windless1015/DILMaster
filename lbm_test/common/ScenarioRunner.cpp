@@ -1,6 +1,7 @@
 #include "ScenarioRunner.hpp"
 #include "services/VTKService.hpp"
 
+#include <cuda_runtime.h>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -82,8 +83,9 @@ void runScenario(const ScenarioConfig &spec) {
 
   FieldStore fieldStore;
   // VTK 用的别名字段（VTKService 期望 "flags" 和 "velocity"）
+  // 注意：velocity 使用 AoS (float3) 格式，与 fluid.velocity 一致
   fieldStore.create(FieldDesc{"flags", nCells, sizeof(uint8_t)});
-  fieldStore.create(FieldDesc{"velocity", nCells * 3, sizeof(float)});
+  fieldStore.create(FieldDesc{"velocity", nCells, sizeof(float3)});
   ctx.fields = &fieldStore;
 
   // allocate() 会在 FieldStore 中创建 fluid.* 字段并初始化 LBMCore
@@ -115,12 +117,13 @@ void runScenario(const ScenarioConfig &spec) {
   }
 
   // 读取初始状态（通过 backend 下载，因为还没执行 step）
+  // 注意：download_fields 使用 SoA 格式，这里只用于 flags/phi/rho
   std::vector<float> h_rho(nCells);
-  std::vector<float> h_u(nCells * 3);
+  std::vector<float> h_u_soa(nCells * 3); // SoA 格式（backend 内部格式）
   std::vector<uint8_t> h_flags(nCells);
   std::vector<float> h_phi(nCells);
 
-  solver.getCore()->backend().download_fields(h_rho.data(), h_u.data(),
+  solver.getCore()->backend().download_fields(h_rho.data(), h_u_soa.data(),
                                               h_flags.data(), h_phi.data());
   double initialMass = calculateTotalMass(h_phi.data(), h_flags.data(), nCells, cfg.rho0);
   printStatus(0, h_flags.data(), nCells, initialMass, initialMass);
@@ -131,14 +134,11 @@ void runScenario(const ScenarioConfig &spec) {
       std::memcpy(handle.data(), h_flags.data(), nCells * sizeof(uint8_t));
     }
     {
-      auto velHandle = fieldStore.get("fluid.velocity");
+      // velocity 使用 AoS (float3) 格式，从 u_aos_ 同步
       auto vtkHandle = fieldStore.get("velocity");
-      // Note: h_u is already in host memory, we can copy from there or from fieldStore
-      // fieldStore "fluid.velocity" (if allocated on host) might not be populated yet if we only did download_fields into local h_u
-      // But allocate() created fieldStore entries with device pointers.
-      // vtkHandle is host-only alias.
-      // We should copy from h_u to vtkHandle.
-      std::memcpy(vtkHandle.data(), h_u.data(), nCells * 3 * sizeof(float));
+      // 从 LBMCore 的 AoS 缓冲区直接拷贝
+      cudaMemcpy(vtkHandle.data(), solver.getCore()->velocityAoSPtr(),
+                 nCells * sizeof(float3), cudaMemcpyDeviceToHost);
     }
     vtkService->onStepEnd(ctx);
   }
@@ -172,9 +172,10 @@ void runScenario(const ScenarioConfig &spec) {
           std::memcpy(handle.data(), flagsPtr, nCells * sizeof(uint8_t));
         }
         {
+          // velocity 使用 AoS (float3) 格式
           auto velHandle = fieldStore.get("fluid.velocity");
           auto vtkHandle = fieldStore.get("velocity");
-          std::memcpy(vtkHandle.data(), velHandle.data(), nCells * 3 * sizeof(float));
+          std::memcpy(vtkHandle.data(), velHandle.data(), nCells * sizeof(float3));
         }
         vtkService->onStepEnd(ctx);
       }

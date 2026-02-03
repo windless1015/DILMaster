@@ -41,24 +41,8 @@ __device__ inline float phi_4(float r) {
   return 0.25f * (1.0f + cosf(M_PI * r * 0.5f));
 }
 
-// 3-point Delta Function (Yang et al., 2009)
-// Support: [-1.5, 1.5]
-__device__ inline float phi_3(float r) {
-  r = fabsf(r);
-  if (r <= 0.5f) {
-    return (1.0f + sqrtf(1.0f - 3.0f * r * r)) / 3.0f;
-  } else if (r <= 1.5f) {
-    return (5.0f - 3.0f * r - sqrtf(-3.0f * (1.0f - r) * (1.0f - r) + 1.0f)) /
-           6.0f;
-  } else {
-    return 0.0f;
-  }
-}
-
 // 辅助：获取网格索引
 __device__ inline int get_idx(int x, int y, int z, int nx, int ny, int nz) {
-  // 简单的边界处理：周期性或截断
-  // 这里使用截断保护，假设物体远离边界
   if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz)
     return -1;
   return z * (nx * ny) + y * nx + x;
@@ -71,16 +55,7 @@ __device__ inline int get_idx(int x, int y, int z, int nx, int ny, int nz) {
 // ============================================================================
 namespace kernels {
 
-// 初始化为零
-__global__ void clear_buffer(float3 *buffer, int n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    buffer[idx] = make_float3(0.0f, 0.0f, 0.0f);
-  }
-}
-
 // 速度插值内核 (Interpolation)
-// U_interp = Sum( U_grid * Delta )
 __global__ void interpolate_velocity(const float3 *marker_pos,
                                      const float3 *grid_vel,
                                      float3 *interp_vel, int nMarkers,
@@ -93,118 +68,270 @@ __global__ void interpolate_velocity(const float3 *marker_pos,
 
   float3 pos = marker_pos[i];
   
-  // 归一化坐标 (Lattice Units)
   float gx = (pos.x - domain_x) / dx;
   float gy = (pos.y - domain_y) / dx;
   float gz = (pos.z - domain_z) / dx;
 
-  // 寻找基准网格点 (Bottom-Left)
-  int x_start, y_start, z_start;
-  int support;
-  
-  if (stencil_width == 2) { // 4-point
-      x_start = (int)floorf(gx - 1.5f);
-      y_start = (int)floorf(gy - 1.5f);
-      z_start = (int)floorf(gz - 1.5f);
-      support = 4;
-  } else { // 2-point or 3-point default
-      x_start = (int)floorf(gx - 0.5f); // 3-point usually centers around nearest int
-      y_start = (int)floorf(gy - 0.5f);
-      z_start = (int)floorf(gz - 0.5f);
-      support = 2; // Default fallback simplified
-      // TODO: strict 3-point logic if needed
-  }
-  // Force 4-point for MDF usually
-  x_start = (int)floorf(gx - 1.5f);
-  y_start = (int)floorf(gy - 1.5f);
-  z_start = (int)floorf(gz - 1.5f);
-  support = 4;
+  int x_start = (int)floorf(gx - 1.5f);
+  int y_start = (int)floorf(gy - 1.5f);
+  int z_start = (int)floorf(gz - 1.5f);
+  int support = 4;
 
   float3 u_sum = {0.0f, 0.0f, 0.0f};
+  float w_sum = 0.0f; 
 
   for (int k = 0; k < support; ++k) {
     for (int j = 0; j < support; ++j) {
-      for (int l = 0; l < support; ++l) { // 'l' used for x to avoid 'i' conflict
+      for (int l = 0; l < support; ++l) { 
         int cx = x_start + l;
         int cy = y_start + j;
         int cz = z_start + k;
 
         int grid_idx = get_idx(cx, cy, cz, nx, ny, nz);
+        
+        float dist_x = gx - cx;
+        float dist_y = gy - cy;
+        float dist_z = gz - cz;
+        float w = phi_4(dist_x) * phi_4(dist_y) * phi_4(dist_z);
+
         if (grid_idx >= 0) {
-          float dist_x = gx - cx;
-          float dist_y = gy - cy;
-          float dist_z = gz - cz;
-          
-          // 使用 4-point 核
-          float w = phi_4(dist_x) * phi_4(dist_y) * phi_4(dist_z);
-          
           float3 u = grid_vel[grid_idx];
           u_sum.x += u.x * w;
           u_sum.y += u.y * w;
           u_sum.z += u.z * w;
+          w_sum += w;
         }
       }
     }
   }
-  interp_vel[i] = u_sum;
+  
+  if (w_sum > 1e-9f) {
+      float inv_w = 1.0f / w_sum;
+      interp_vel[i] = make_float3(u_sum.x * inv_w, u_sum.y * inv_w, u_sum.z * inv_w);
+  } else {
+      interp_vel[i] = make_float3(0.0f, 0.0f, 0.0f);
+  }
+}
+
+// 标量插值内核 (密度)
+__global__ void interpolate_scalar(const float3 *marker_pos,
+                                   const float *grid_scalar,
+                                   float *interp_scalar, int nMarkers,
+                                   float dx, int nx, int ny, int nz,
+                                   float domain_x, float domain_y,
+                                   float domain_z) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nMarkers) return;
+
+  float3 pos = marker_pos[i];
+  float gx = (pos.x - domain_x) / dx;
+  float gy = (pos.y - domain_y) / dx;
+  float gz = (pos.z - domain_z) / dx;
+
+  int x_start = (int)floorf(gx - 1.5f);
+  int y_start = (int)floorf(gy - 1.5f);
+  int z_start = (int)floorf(gz - 1.5f);
+  int support = 4;
+
+  float s_sum = 0.0f;
+  float w_sum = 0.0f;
+
+  for (int k = 0; k < support; ++k) {
+    for (int j = 0; j < support; ++j) {
+      for (int l = 0; l < support; ++l) { 
+        int cx = x_start + l;
+        int cy = y_start + j;
+        int cz = z_start + k;
+        int grid_idx = get_idx(cx, cy, cz, nx, ny, nz);
+        float dist_x = gx - cx;
+        float dist_y = gy - cy;
+        float dist_z = gz - cz;
+        float w = phi_4(dist_x) * phi_4(dist_y) * phi_4(dist_z);
+        if (grid_idx >= 0) {
+          s_sum += grid_scalar[grid_idx] * w;
+          w_sum += w;
+        }
+      }
+    }
+  }
+  
+  if (w_sum > 1e-9f) {
+      interp_scalar[i] = s_sum / w_sum;
+  } else {
+      interp_scalar[i] = 1.0f; // Default rho=1
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Masked Kernels (Free Surface Support)
+// ----------------------------------------------------------------------------
+
+__global__ void interpolate_velocity_masked(const float3 *marker_pos,
+                                            const float3 *grid_vel,
+                                            const uint8_t *mask_valid, // 1=Valid, 0=Invalid
+                                            float3 *interp_vel, 
+                                            unsigned int *fallback_count, // Atomic counter
+                                            int nMarkers,
+                                            float dx, int nx, int ny, int nz,
+                                            float domain_x, float domain_y,
+                                            float domain_z, 
+                                            float eps) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nMarkers) return;
+
+  float3 pos = marker_pos[i];
+  
+  float gx = (pos.x - domain_x) / dx;
+  float gy = (pos.y - domain_y) / dx;
+  float gz = (pos.z - domain_z) / dx;
+
+  int x_start = (int)floorf(gx - 1.5f);
+  int y_start = (int)floorf(gy - 1.5f);
+  int z_start = (int)floorf(gz - 1.5f);
+  int support = 4;
+
+  float3 u_sum = {0.0f, 0.0f, 0.0f};
+  float w_sum = 0.0f; 
+
+  for (int k = 0; k < support; ++k) {
+    for (int j = 0; j < support; ++j) {
+      for (int l = 0; l < support; ++l) { 
+        int cx = x_start + l;
+        int cy = y_start + j;
+        int cz = z_start + k;
+
+        int grid_idx = get_idx(cx, cy, cz, nx, ny, nz);
+        
+        float dist_x = gx - cx;
+        float dist_y = gy - cy;
+        float dist_z = gz - cz;
+        float w = phi_4(dist_x) * phi_4(dist_y) * phi_4(dist_z);
+
+        if (grid_idx >= 0) {
+            // Check Mask
+            bool is_valid = (mask_valid == nullptr) || (mask_valid[grid_idx] != 0);
+            if (is_valid) {
+              float3 u = grid_vel[grid_idx];
+              u_sum.x += u.x * w;
+              u_sum.y += u.y * w;
+              u_sum.z += u.z * w;
+              w_sum += w;
+            }
+        }
+      }
+    }
+  }
+  
+  if (w_sum > eps) {
+      float inv_w = 1.0f / w_sum;
+      interp_vel[i] = make_float3(u_sum.x * inv_w, u_sum.y * inv_w, u_sum.z * inv_w);
+  } else {
+      interp_vel[i] = make_float3(0.0f, 0.0f, 0.0f); // Default safe value
+      if (fallback_count) atomicAdd(fallback_count, 1);
+  }
+}
+
+__global__ void spread_force_masked(const float3 *marker_pos, const float3 *marker_force,
+                                    float3 *grid_force, 
+                                    const uint8_t *mask_valid,
+                                    const float *fill_fraction,
+                                    int nMarkers, float dx,
+                                    int nx, int ny, int nz, 
+                                    float domain_x, float domain_y, float domain_z, 
+                                    float vol_scale, bool use_fill) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= nMarkers) return;
+
+  float3 pos = marker_pos[i];
+  float3 f = marker_force[i];
+  
+  float gx = (pos.x - domain_x) / dx;
+  float gy = (pos.y - domain_y) / dx;
+  float gz = (pos.z - domain_z) / dx;
+
+  int x_start = (int)floorf(gx - 1.5f);
+  int y_start = (int)floorf(gy - 1.5f);
+  int z_start = (int)floorf(gz - 1.5f);
+  
+  for (int k = 0; k < 4; ++k) {
+    for (int j = 0; j < 4; ++j) {
+      for (int l = 0; l < 4; ++l) {
+        int cx = x_start + l;
+        int cy = y_start + j;
+        int cz = z_start + k;
+        
+        int grid_idx = get_idx(cx, cy, cz, nx, ny, nz);
+        if (grid_idx >= 0) {
+           // Check Mask
+           bool is_valid = (mask_valid == nullptr) || (mask_valid[grid_idx] != 0);
+           
+           if (is_valid) {
+               float dist_x = gx - cx;
+               float dist_y = gy - cy;
+               float dist_z = gz - cz;
+               float w = phi_4(dist_x) * phi_4(dist_y) * phi_4(dist_z);
+               
+               float val = w * vol_scale;
+               
+               // Apply Fill Weighting
+               if (use_fill && fill_fraction != nullptr) {
+                   val *= fill_fraction[grid_idx];
+               }
+               
+               atomicAdd(&grid_force[grid_idx].x, f.x * val);
+               atomicAdd(&grid_force[grid_idx].y, f.y * val);
+               atomicAdd(&grid_force[grid_idx].z, f.z * val);
+           }
+        }
+      }
+    }
+  }
 }
 
 // 计算修正力内核
-// dF = rho * (U_target - U_interp) / dt
+// dF = rho * (U_target - U_interp) / dt * Area * Beta
 __global__ void compute_correction_force(const float3 *marker_vel,
                                          const float3 *interp_vel,
+                                         const float *marker_area, 
+                                         const float *interp_rho, // [Rho]
                                          float3 *delta_force,
-                                         float3 *accum_force, // 累加到总力
-                                         float dt, float rho_default,
+                                         float3 *accum_force, 
+                                         float dt,
+                                         float beta,
                                          int nMarkers) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= nMarkers)
-    return;
+  if (i >= nMarkers) return;
     
-  // 暂时使用常量密度，如果需要局部密度插值可扩展
-  float rho = rho_default; 
-  
-  float3 u_t = marker_vel[i]; // Target
-  float3 u_i = interp_vel[i]; // Interpolated
+  float rho = (interp_rho != nullptr) ? interp_rho[i] : 1.0f;
+  float area = (marker_area != nullptr) ? marker_area[i] : 1.0f;
+
+  float3 u_t = marker_vel[i]; 
+  float3 u_i = interp_vel[i]; 
   
   float3 df;
-  df.x = rho * (u_t.x - u_i.x) / dt;
-  df.y = rho * (u_t.y - u_i.y) / dt;
-  df.z = rho * (u_t.z - u_i.z) / dt;
+  float factor = beta * rho * area / dt;
+  
+  df.x = factor * (u_t.x - u_i.x);
+  df.y = factor * (u_t.y - u_i.y);
+  df.z = factor * (u_t.z - u_i.z);
   
   delta_force[i] = df;
   
-  // 累加到标记点总力
   accum_force[i].x += df.x;
   accum_force[i].y += df.y;
   accum_force[i].z += df.z;
 }
 
 // 力投射内核 (Spreading)
-// F_grid += Sum( F_marker * Delta )
 __global__ void spread_force(const float3 *marker_pos, const float3 *marker_force,
                              float3 *grid_force, int nMarkers, float dx,
                              int nx, int ny, int nz, float domain_x,
                              float domain_y, float domain_z, float vol_scale) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= nMarkers)
-    return;
+  if (i >= nMarkers) return;
 
   float3 pos = marker_pos[i];
   float3 f = marker_force[i];
-  
-  // 物理单位转换：
-  // marker_force (N) -> grid_force_density (N/m^3) or force on node?
-  // IBM 公式：f(x) = sum F(X) * delta(x-X) * vol_fraction
-  // 这里 f 是 Grid 上的力。
-  // delta 函数单位是 1/dx^3。
-  // 所以 f_grid = F_marker * (1/dx^3) * (marker_vol?)
-  // 通常 LBM 需要的是 Force Density 或者 Force per Node。
-  // 标准公式：f_grid(x) = sum F_k * delta * V_k
-  // 这里 delta = phi/dx^3? 不，phi 是无量纲的，delta = phi/dx (1D).
-  // 3D delta = phi(x)*phi(y)*phi(z) / dx^3.
-  // 这部分常数由外部 vol_scale控制。
-  // 假设 vol_scale = 1.0/dx^3 * marker_vol. 如果 marker_vol ~ dx^3, 则 scale~1.
   
   float gx = (pos.x - domain_x) / dx;
   float gy = (pos.y - domain_y) / dx;
@@ -240,18 +367,19 @@ __global__ void spread_force(const float3 *marker_pos, const float3 *marker_forc
 }
 
 // 更新流体速度内核 (MDF step)
-// U_new = U_old + F * dt / rho
-__global__ void update_fluid_vel(float3 *u, const float3 *f, float dt,
-                                 float rho_inv, int nCells) {
+__global__ void update_fluid_vel(float3 *u, const float3 *f_grid, const float* rho_field, 
+                                 float dt, float rho_default, int nCells) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= nCells) return;
   
-  float3 force = f[i];
-  // 仅在有力的地方更新
+  float3 force = f_grid[i];
   if (force.x != 0.0f || force.y != 0.0f || force.z != 0.0f) {
-      u[i].x += force.x * dt * rho_inv;
-      u[i].y += force.y * dt * rho_inv;
-      u[i].z += force.z * dt * rho_inv;
+      float rho = (rho_field != nullptr) ? rho_field[i] : rho_default;
+      float inv_rho = 1.0f / (rho + 1e-9f);
+      
+      u[i].x += force.x * dt * inv_rho;
+      u[i].y += force.y * dt * inv_rho;
+      u[i].z += force.z * dt * inv_rho;
   }
 }
 
@@ -287,13 +415,19 @@ void IBMBackend::allocate_memory() {
       CUDA_CHECK(cudaMalloc(&position_, n * sizeof(float3)));
       CUDA_CHECK(cudaMalloc(&velocity_, n * sizeof(float3)));
       CUDA_CHECK(cudaMalloc(&force_, n * sizeof(float3)));
+      CUDA_CHECK(cudaMalloc(&area_, n * sizeof(float))); 
       
       // MDF Buffers
       CUDA_CHECK(cudaMalloc(&interpolated_velocity_, n * sizeof(float3)));
+      CUDA_CHECK(cudaMalloc(&interpolated_density_, n * sizeof(float))); // [Rho]
+      CUDA_CHECK(cudaMalloc(&interpolated_density_, n * sizeof(float))); // [Rho]
       CUDA_CHECK(cudaMalloc(&delta_force_, n * sizeof(float3)));
   }
   
-  // Grid Buffer (size nx*ny*nz)
+  // Debug Counter
+  CUDA_CHECK(cudaMalloc(&d_fallback_count_, sizeof(unsigned int)));
+
+  // Grid Buffer
   size_t nCells = params_.nx * params_.ny * params_.nz;
   if (nCells > 0) {
       CUDA_CHECK(cudaMalloc(&temp_fluid_velocity_, nCells * sizeof(float3)));
@@ -304,16 +438,22 @@ void IBMBackend::free_memory() {
   if (position_) cudaFree(position_);
   if (velocity_) cudaFree(velocity_);
   if (force_) cudaFree(force_);
+  if (area_) cudaFree(area_);
   if (interpolated_velocity_) cudaFree(interpolated_velocity_);
+  if (interpolated_density_) cudaFree(interpolated_density_);
   if (delta_force_) cudaFree(delta_force_);
   if (temp_fluid_velocity_) cudaFree(temp_fluid_velocity_);
+  if (d_fallback_count_) cudaFree(d_fallback_count_);
   
   position_ = nullptr;
   velocity_ = nullptr;
   force_ = nullptr;
+  area_ = nullptr;
   interpolated_velocity_ = nullptr;
+  interpolated_density_ = nullptr;
   delta_force_ = nullptr;
   temp_fluid_velocity_ = nullptr;
+  d_fallback_count_ = nullptr;
 }
 
 void IBMBackend::initialize(const IBMParams &params) {
@@ -324,41 +464,127 @@ void IBMBackend::initialize(const IBMParams &params) {
     if (position_) CUDA_CHECK(cudaMemset(position_, 0, params_.nMarkers * sizeof(float3)));
     if (velocity_) CUDA_CHECK(cudaMemset(velocity_, 0, params_.nMarkers * sizeof(float3)));
     if (force_) CUDA_CHECK(cudaMemset(force_, 0, params_.nMarkers * sizeof(float3)));
+    if (area_) CUDA_CHECK(cudaMemset(area_, 0, params_.nMarkers * sizeof(float)));
+    if (interpolated_density_) CUDA_CHECK(cudaMemset(interpolated_density_, 0, params_.nMarkers * sizeof(float)));
+    if (d_fallback_count_) CUDA_CHECK(cudaMemset(d_fallback_count_, 0, sizeof(unsigned int)));
     allocated_ = true;
 }
 
-void IBMBackend::interpolateVelocity(const float3* grid_u) {
+void IBMBackend::interpolateVelocity(const float3* grid_u, const uint8_t* mask) {
     int n = (int)params_.nMarkers;
     int blockSize = 256;
     int gridSize = (n + blockSize - 1) / blockSize;
     
-    kernels::interpolate_velocity<<<gridSize, blockSize>>>(
-        position_, grid_u, interpolated_velocity_, n,
-        params_.dx, params_.nx, params_.ny, params_.nz,
-        params_.domain_origin_x, params_.domain_origin_y, params_.domain_origin_z,
-        params_.stencil_width
-    );
+    if (params_.enable_masked_fs) {
+        // Reset counter before interp? Or accumulate? Usually reset per step or per call.
+        // Let's not reset inside helper, user might want cumulative.
+        // Actually, we should probably reset at start of computeForces.
+        kernels::interpolate_velocity_masked<<<gridSize, blockSize>>>(
+            position_, grid_u, mask, interpolated_velocity_, d_fallback_count_, n,
+            params_.dx, params_.nx, params_.ny, params_.nz,
+            params_.domain_origin_x, params_.domain_origin_y, params_.domain_origin_z,
+            params_.mask_eps
+        );
+    } else {
+        kernels::interpolate_velocity<<<gridSize, blockSize>>>(
+            position_, grid_u, interpolated_velocity_, n,
+            params_.dx, params_.nx, params_.ny, params_.nz,
+            params_.domain_origin_x, params_.domain_origin_y, params_.domain_origin_z,
+            params_.stencil_width
+        );
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
-void IBMBackend::spreadForce(const float3* marker_force, float3* grid_force) {
+// [Rho]
+void IBMBackend::computeForces(const float3 *fluid_velocity, const float *fluid_density,
+                               float3 *fluid_force_out, float dt,
+                               const uint8_t *valid_mask, const float *fill_fraction) {
+   if (!allocated_) return;
+   
+   int nCells = params_.nx * params_.ny * params_.nz;
+   int blockSize = 256;
+   int gridSize = (nCells + blockSize - 1) / blockSize;
+   
+   // 1. 初始化
+   kernels::copy_float3_array<<<gridSize, blockSize>>>(fluid_velocity, temp_fluid_velocity_, nCells);
+   CUDA_CHECK(cudaMemset(force_, 0, params_.nMarkers * sizeof(float3)));
+   CUDA_CHECK(cudaMemset(fluid_force_out, 0, nCells * sizeof(float3)));
+   // Reset fallback count for this step
+   if (d_fallback_count_) CUDA_CHECK(cudaMemset(d_fallback_count_, 0, sizeof(unsigned int)));
+   
+   // 2. 插值流体密度 (只做一次)
+   int mGrid = ((int)params_.nMarkers + blockSize - 1) / blockSize;
+   if (fluid_density) {
+       kernels::interpolate_scalar<<<mGrid, blockSize>>>(
+           position_, fluid_density, interpolated_density_, (int)params_.nMarkers,
+           params_.dx, params_.nx, params_.ny, params_.nz,
+           params_.domain_origin_x, params_.domain_origin_y, params_.domain_origin_z
+       );
+   }
+   
+   // 3. MDF 迭代
+   for (int k = 0; k < params_.mdf_iterations; ++k) {
+       // A. 插值 (From current u_pred)
+       interpolateVelocity(temp_fluid_velocity_, valid_mask);
+       
+       // B. 计算修正力 delta_F
+       kernels::compute_correction_force<<<mGrid, blockSize>>>(
+           velocity_, interpolated_velocity_, area_, 
+           (fluid_density ? interpolated_density_ : nullptr), 
+           delta_force_, force_,
+           dt, params_.mdf_beta, (int)params_.nMarkers
+       );
+       
+       // C. Spread
+       spreadForce(delta_force_, fluid_force_out, valid_mask, fill_fraction);
+       
+       // D. Update u_pred
+       // Note: updateTempVelocity modifies temp_fluid_velocity_ in place based on grid_force
+       // We need to re-copy base velocity first? 
+       // Logic: U_pred = U_base + Force * dt / rho
+       // So we copy base, then add force.
+       kernels::copy_float3_array<<<gridSize, blockSize>>>(fluid_velocity, temp_fluid_velocity_, nCells);
+       updateTempVelocity(fluid_force_out, fluid_density, dt);
+   }
+   
+   CUDA_CHECK(cudaGetLastError());
+}
+
+void IBMBackend::spreadForce(const float3* marker_force, float3* grid_force,
+                             const uint8_t* mask, const float* fill) {
     int n = (int)params_.nMarkers;
     int blockSize = 256;
     int gridSize = (n + blockSize - 1) / blockSize;
     
-    // Scale factor: 1/dx^3 (Assuming dx=1 in lattice, volume=1)
-    // 根据 LBM 习惯，通常 forces 直接加到 F_ext，且 markers 代表的体积 vol_k 
-    // 如果是体积力，spread 后需要除以 dx^3。
-    // 这里假设 dx=1 (Lattice Units)，所以 vol_scale = 1.0 (如果每个marker代表1个格子体积)
-    float vol_scale = 1.0f; 
+    // Scale factor: 1/dx^3
+    float dVol = params_.dx * params_.dx * params_.dx;
+    float vol_scale = 1.0f / dVol;
     
-    kernels::spread_force<<<gridSize, blockSize>>>(
-        position_, marker_force, grid_force, n,
-        params_.dx, params_.nx, params_.ny, params_.nz,
-        params_.domain_origin_x, params_.domain_origin_y, params_.domain_origin_z,
-        vol_scale
-    );
+    if (params_.enable_masked_fs) {
+        kernels::spread_force_masked<<<gridSize, blockSize>>>(
+            position_, marker_force, grid_force, 
+            mask, fill,
+            n, params_.dx, params_.nx, params_.ny, params_.nz,
+            params_.domain_origin_x, params_.domain_origin_y, params_.domain_origin_z,
+            vol_scale, params_.use_fill_weight
+        );
+    } else {
+        kernels::spread_force<<<gridSize, blockSize>>>(
+            position_, marker_force, grid_force, n,
+            params_.dx, params_.nx, params_.ny, params_.nz,
+            params_.domain_origin_x, params_.domain_origin_y, params_.domain_origin_z,
+            vol_scale
+        );
+    }
     CUDA_CHECK(cudaGetLastError());
+}
+
+unsigned int IBMBackend::getFallbackCount() const {
+    if (!allocated_ || !d_fallback_count_) return 0;
+    unsigned int h_count = 0;
+    CUDA_CHECK(cudaMemcpy(&h_count, d_fallback_count_, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    return h_count;
 }
 
 void IBMBackend::updateTempVelocity(const float3* grid_force, const float* rho, float dt) {
@@ -366,67 +592,12 @@ void IBMBackend::updateTempVelocity(const float3* grid_force, const float* rho, 
     int blockSize = 256;
     int gridSize = (nCells + blockSize - 1) / blockSize;
     
-    // 假设 rho 均匀 = 1.0，或传入了 density field
-    // TODO: 支持 variable density
-    float rho_inv = 1.0f; 
+    float rho_default = 1.0f; 
     
     kernels::update_fluid_vel<<<gridSize, blockSize>>>(
-        temp_fluid_velocity_, grid_force, dt, rho_inv, nCells
+        temp_fluid_velocity_, grid_force, rho, dt, rho_default, nCells
     );
     CUDA_CHECK(cudaGetLastError());
-}
-
-void IBMBackend::computeForces(const float3 *fluid_velocity, const float *fluid_density,
-                               float3 *fluid_force_out, float dt) {
-   if (!allocated_) return;
-   
-   int nCells = params_.nx * params_.ny * params_.nz;
-   
-   // 1. 初始化
-   // 拷贝当前流体速度到临时 buffer
-   int blockSize = 256;
-   int gridSize = (nCells + blockSize - 1) / blockSize;
-   kernels::copy_float3_array<<<gridSize, blockSize>>>(fluid_velocity, temp_fluid_velocity_, nCells);
-   
-   // 清空 标记点总力
-   CUDA_CHECK(cudaMemset(force_, 0, params_.nMarkers * sizeof(float3)));
-   
-   // 清空 输出流体力场 (作为累加器) -> Wait, user might want to accumulate? 
-   // Usually we overwrite current step forces.
-   CUDA_CHECK(cudaMemset(fluid_force_out, 0, nCells * sizeof(float3)));
-
-   // 2. MDF 迭代
-   for (int k = 0; k < params_.mdf_iterations; ++k) {
-       // A. 插值 (From temp fluid vel)
-       interpolateVelocity(temp_fluid_velocity_);
-       
-       // B. 计算修正力 delta_F
-       int mGrid = ((int)params_.nMarkers + blockSize - 1) / blockSize;
-       kernels::compute_correction_force<<<mGrid, blockSize>>>(
-           velocity_, interpolated_velocity_, delta_force_, force_,
-           dt, 1.0f, (int)params_.nMarkers
-       );
-       
-       // C. 投射修正力 delta_F 到网格 (Accumulate directly to output buffer)
-       spreadForce(delta_force_, fluid_force_out);
-       
-       // D. 更新临时流体速度 (以便下一次迭代能感知)
-       // U_tmp += delta_F_grid * dt
-       // 但是 fluid_force_out 累加了所有的 F，我们这里只能用当前的 delta_F_grid。
-       // 这是一个问题：spread 并没有分开 delta_F_grid。
-       // 优化方案：重新利用 temp_fluid_velocity_ updated from base U?
-       // U_tmp = U_base + Total_F_grid * dt.
-       // 因为 fluid_force_out 保存的是 Total_F_grid.
-       // 所以我们可以在每次迭代末尾，用 fluid_force_out 重置 U_tmp。
-       // U_tmp = U_in + F_out * dt.
-       
-       // 重置 U_tmp 为 U_base
-       kernels::copy_float3_array<<<gridSize, blockSize>>>(fluid_velocity, temp_fluid_velocity_, nCells);
-       // 添加累积的力产生的速度变化
-       updateTempVelocity(fluid_force_out, fluid_density, dt);
-   }
-   
-   CUDA_CHECK(cudaGetLastError());
 }
 
 // ... (Other backend methods wrappers) ...
@@ -435,6 +606,9 @@ void IBMBackend::uploadPositions(const float3 *h_p) {
 }
 void IBMBackend::uploadVelocities(const float3 *h_v) {
     if (allocated_) CUDA_CHECK(cudaMemcpy(velocity_, h_v, params_.nMarkers * sizeof(float3), cudaMemcpyHostToDevice));
+}
+void IBMBackend::uploadAreas(const float *h_a) {
+    if (allocated_) CUDA_CHECK(cudaMemcpy(area_, h_a, params_.nMarkers * sizeof(float), cudaMemcpyHostToDevice));
 }
 void IBMBackend::downloadPositions(float3 *h_p) const {
     if (allocated_) CUDA_CHECK(cudaMemcpy(h_p, position_, params_.nMarkers * sizeof(float3), cudaMemcpyDeviceToHost));
@@ -445,6 +619,15 @@ void IBMBackend::downloadForces(float3 *h_f) const {
 void IBMBackend::downloadVelocities(float3 *h_v) const {
     if (allocated_) CUDA_CHECK(cudaMemcpy(h_v, velocity_, params_.nMarkers * sizeof(float3), cudaMemcpyDeviceToHost));
 }
+
+#ifdef IBM_TESTING
+void IBMBackend::downloadInterpolatedVelocity(float3 *h_u) const {
+    if (allocated_ && interpolated_velocity_) {
+        CUDA_CHECK(cudaMemcpy(h_u, interpolated_velocity_, params_.nMarkers * sizeof(float3), cudaMemcpyDeviceToHost));
+    }
+}
+#endif
+
 void IBMBackend::clearForces() {
      if (allocated_) CUDA_CHECK(cudaMemset(force_, 0, params_.nMarkers * sizeof(float3)));
 }
@@ -456,13 +639,6 @@ void IBMBackend::updateMarkers(const float3 *new_pos, const float3 *new_vel) {
     if (new_pos) uploadPositions(new_pos);
     if (new_vel) uploadVelocities(new_vel);
 }
-void IBMBackend::updatePositions(const float3 *new_pos) {
-    if (new_pos) uploadPositions(new_pos);
-}
-void IBMBackend::updateVelocities(const float3 *new_vel) {
-    if (new_vel) uploadVelocities(new_vel);
-}
-
 void IBMBackend::convertForceAoSToSoA(const float3 *force_aos, float *force_soa,
                                       int nCells) const {
     if (!force_aos || !force_soa || nCells <= 0) return;
@@ -471,7 +647,6 @@ void IBMBackend::convertForceAoSToSoA(const float3 *force_aos, float *force_soa,
     kernels::convert_force_aos_to_soa<<<gridSize, blockSize>>>(force_aos, force_soa, nCells);
     CUDA_CHECK(cudaGetLastError());
 }
-
 
 // ============================================================================
 // IBMCore Implementation
@@ -500,24 +675,30 @@ void IBMCore::updateMarkers(const float3 *new_pos, const float3 *new_vel) {
     backend_.updateMarkers(new_pos, new_vel);
 }
 
-void IBMCore::computeForces(const float3 *fluid_vel, const float *fluid_den, float3 *fluid_force, float dt) {
+void IBMCore::updateMarkers(const float3 *new_pos, const float3 *new_vel, const float *new_areas) {
     if (!initialized_) initialize();
-    backend_.computeForces(fluid_vel, fluid_den, fluid_force, dt);
+    backend_.uploadPositions(new_pos);
+    backend_.uploadVelocities(new_vel);
+    backend_.uploadAreas(new_areas);
+}
+
+void IBMCore::computeForces(const float3 *fluid_velocity, const float *fluid_density,
+                            float3 *fluid_force_out, float dt,
+                            const uint8_t *valid_mask, const float *fill_fraction) {
+    if (!initialized_) initialize();
+    backend_.computeForces(fluid_velocity, fluid_density, fluid_force_out, dt, valid_mask, fill_fraction);
 }
 
 void IBMCore::clearForces() { backend_.clearForces(); }
 
 void IBMCore::uploadPositions(const float3 *p) { backend_.uploadPositions(p); }
 void IBMCore::uploadVelocities(const float3 *v) { backend_.uploadVelocities(v); }
+void IBMCore::uploadAreas(const float *a) { backend_.uploadAreas(a); } // [Area]
 void IBMCore::downloadPositions(float3 *p) const { backend_.downloadPositions(p); }
 void IBMCore::downloadForces(float3 *f) const { backend_.downloadForces(f); }
 
-void IBMCore::applyRotation(float3 axis, float3 center, float angle) {
-    // 简单透传内核调用，此处省略具体实现以保持简洁，使用之前定义的逻辑即可
-}
-void IBMCore::applyTranslation(float3 displacement) {
-     // 同上
-}
+void IBMCore::applyRotation(float3 axis, float3 center, float angle) { }
+void IBMCore::applyTranslation(float3 displacement) { }
 bool IBMCore::checkHealth() const { return backend_.is_initialized(); }
 void IBMCore::synchronize() const { backend_.synchronize(); }
 
