@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iomanip>
+#include <sstream>
 #include <filesystem>
 #include <map>
 #include <numeric>
@@ -161,47 +162,41 @@ void run_simulation(double spacing, int steps, bool mean_flow_removal, const std
     // Fibonacci Sphere or Simple loop? Simple loop is easier for robust area weights if available.
     // Or just rejection sampling from grid.
     // Let's use grid rejection for uniform spacing.
-    int i_min = (int)((center.x - radius - 2)/spacing_phy);
-    int i_max = (int)((center.x + radius + 2)/spacing_phy);
-    int j_min = (int)((center.y - radius - 2)/spacing_phy);
-    int j_max = (int)((center.y + radius + 2)/spacing_phy);
-    int k_min = (int)((center.z - radius - 2)/spacing_phy);
-    int k_max = (int)((center.z + radius + 2)/spacing_phy);
+    // Fibonacci Sphere Sampling
+    #ifndef M_PI
+    #define M_PI 3.14159265358979323846f
+    #endif
+
+    float surface_area = 4.0f * (float)M_PI * radius * radius;
+    // marker_area already defined above
+    int n_markers_target = (int)std::ceil(surface_area / marker_area);
     
-    for(int i=i_min; i<=i_max; ++i) {
-        for(int j=j_min; j<=j_max; ++j) {
-            for(int k=k_min; k<=k_max; ++k) {
-                float x = i * spacing_phy;
-                float y = j * spacing_phy;
-                float z = k * spacing_phy;
-                
-                float dist = sqrtf((x-center.x)*(x-center.x) + 
-                                 (y-center.y)*(y-center.y) + 
-                                 (z-center.z)*(z-center.z));
-                
-                // Project to surface
-                // Only select nodes close to surface (Shell)
-                // If we select all internal nodes, we get huge overlap after projection.
-                // Select shell of +/- 0.6 * spacing
-                if (std::abs(dist - radius) < 0.6f * spacing_phy) {
-                    float3 p = make_float3(
-                        center.x + (x-center.x)/dist * radius,
-                        center.y + (y-center.y)/dist * radius,
-                        center.z + (z-center.z)/dist * radius
-                    );
-                    
-                    pos.push_back(p);
-                    vel.push_back(make_float3(0.0f, 0.0f, 0.0f)); // Fixed sphere
-                    area.push_back(marker_area);
-                }
-            }
-        }
+    float golden_ratio = (1.0f + sqrtf(5.0f)) / 2.0f;
+    float golden_angle = 2.0f * (float)M_PI * (1.0f - 1.0f/golden_ratio);
+
+    for(int i=0; i<n_markers_target; ++i) {
+        float z = 1.0f - (2.0f * i + 1.0f) / n_markers_target; 
+        float r_slice = sqrtf(1.0f - z*z);
+        
+        float theta = golden_angle * i;
+        
+        float x = r_slice * cosf(theta);
+        float y = r_slice * sinf(theta);
+        
+        float3 p = make_float3(
+            center.x + x * radius,
+            center.y + y * radius,
+            center.z + z * radius
+        );
+        
+        pos.push_back(p);
+        vel.push_back(make_float3(0.0f, 0.0f, 0.0f)); 
+        area.push_back(marker_area); 
     }
     
-    // Remove duplicates or refine? Grid method is usually okay for "visually complete" test.
-    
     size_t nMarkers = pos.size();
-    std::cout << "Generated " << nMarkers << " markers for Sphere R=" << radius << std::endl;
+    std::cout << "Generated " << nMarkers << " markers (Fibonacci Sphere) for R=" << radius << std::endl;
+    std::cout << "Target Spacing: " << spacing_phy << ", Actual Avg Spacing: " << sqrtf(surface_area/nMarkers) << std::endl;
     
     // Write Markers VTK
     {

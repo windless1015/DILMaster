@@ -91,6 +91,23 @@ target_include_directories(ibm_sphere_drag3d PRIVATE
     ${CMAKE_SOURCE_DIR}/src/physics/lbm/cuda
 )
 target_compile_definitions(ibm_sphere_drag3d PRIVATE IBM_TESTING)
+
+# Sphere Translate 3D
+add_executable(ibm_sphere_translate3d 
+    ibm_sphere_translate3d.cu 
+    ../src/physics/ibm/IBMCore.cu
+    ../src/services/VTKService.cpp
+    ../src/services/MarkerVTKService.cpp
+)
+set_target_properties(ibm_sphere_translate3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
+target_link_libraries(ibm_sphere_translate3d PRIVATE physics ${CUDA_LIBRARIES})
+target_include_directories(ibm_sphere_translate3d PRIVATE 
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/physics
+    ${CMAKE_SOURCE_DIR}/src/physics/lbm
+    ${CMAKE_SOURCE_DIR}/src/physics/lbm/cuda
+)
+target_compile_definitions(ibm_sphere_translate3d PRIVATE IBM_TESTING)
 target_compile_definitions(ibm_couette3d PRIVATE IBM_TESTING)
 set_target_properties(ibm_couette3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 

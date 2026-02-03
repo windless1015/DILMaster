@@ -15,6 +15,7 @@ public:
     int ny = 1;
     int nz = 1;
     float dx = 1.0f;
+    bool binary = true; // Default to binary for performance
   };
 
   explicit VTKService(const Config &config);
