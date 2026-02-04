@@ -58,35 +58,7 @@ void VTKService::writeVTIFile(const StepContext &ctx) {
 
   // Data Arrays Definitions
   uint64_t offset = 0;
-  
-  // Helper lambda for offset calculation
-  auto calculate_offset = [&](const std::string& field_name, int components) {
-      if (!ctx.fields->exists(field_name)) return;
-      auto handle = ctx.fields->get(field_name);
-      size_t count = handle.count(); // Should be nPoints for scalars or nPoints*3 for vectors? 
-      // FieldStore stores flattened count?
-      // Actually usually count is number of elements. 
-      // For float scalar: count = nPoints. Size = nPoints * 4.
-      // For float3: count = nPoints. Size = nPoints * 12.
-      
-      size_t data_bytes = handle.size_bytes(); 
-      // Allow implicit vector conversion for velocity
-      if (field_name == "velocity" && components == 3) {
-          // Special handling: maybe SoA to AoS?
-          // If stored as SoA (3 * nPoints floats), size is same.
-          // Binary write will write it raw.
-          // IF SoA, we need to interleave for VTI?
-          // VTK ImageData usually usually expects AoS (tuple by tuple).
-          // If our generic fields are AoS, we are good.
-          // If velocity is SoA (as in old code), we need to reorder on write.
-          // For binary appended, we can't easily reorder "in place" without a buffer.
-          // For now, let's assume we copy to a temporary buffer if needed, or if generic fields are AoS.
-      }
-      
-      // format="appended" offset="..."
-  };
 
-  // We iterate fields twice: once for XML decl, once for Binary Data
   // List of active fields to write
   struct FieldInfo {
       std::string name;
@@ -96,18 +68,14 @@ void VTKService::writeVTIFile(const StepContext &ctx) {
   };
   std::vector<FieldInfo> active_fields;
 
-  // 1. Generic Fields
+  // Generic Fields from config (including Velocity)
   for(const auto& name : config_.fields) {
       if(ctx.fields->exists(name)) {
           auto h = ctx.fields->get(name);
           size_t comps = 1;
-          if(h.element_size() == 12) comps = 3;
+          if(h.element_size() == 12) comps = 3; // float3 = 12 bytes
           active_fields.push_back({name, name, (int)comps, h.size_bytes()});
       }
-  }
-  // 2. Velocity Special Case
-  if(ctx.fields->exists("velocity")) {
-      active_fields.push_back({"velocity", "Velocity", 3, (size_t)nPoints * 3 * sizeof(float)});
   }
 
   // XML Declaration
@@ -135,33 +103,13 @@ void VTKService::writeVTIFile(const StepContext &ctx) {
           const char* ptr = (const char*)h.data();
           uint32_t size = (uint32_t)f.data_size;
           
-          if(f.name == "velocity") {
-              // Special Velocity Handling (SoA -> AoS conversion if needed)
-              // Original code implied SoA: [Ux...Uy...Uz...]
-              // VTK needs AoS: [Ux Uy Uz, Ux Uy Uz...]
-              // We need a temp buffer
-              std::vector<float> aos(nPoints * 3);
-              const float* soa = (const float*)ptr;
-              for(int i=0; i<nPoints; ++i) {
-                  aos[3*i+0] = soa[i];
-                  aos[3*i+1] = soa[nPoints+i];
-                  aos[3*i+2] = soa[2*nPoints+i];
-              }
-              file.write((const char*)&size, sizeof(uint32_t));
-              file.write((const char*)aos.data(), size);
-          } else {
-             // Generic fields assumed AoS or Scalar
-             file.write((const char*)&size, sizeof(uint32_t));
-             file.write(ptr, size);
-          }
+          // All fields are assumed to be in correct format (AoS for vectors)
+          file.write((const char*)&size, sizeof(uint32_t));
+          file.write(ptr, size);
       }
       file << "\n  </AppendedData>\n";
-  } else {
-      // ASCII (Legacy implementation fallback or not supported/removed for cleaner code)
-      // Since user asked to "merge logic", I'll remove the ASCII block to keep file clean 
-      // or keep it if binary=false.
-      // Let's assume user prefers binary.
   }
   
   file << "</VTKFile>\n";
 }
+
