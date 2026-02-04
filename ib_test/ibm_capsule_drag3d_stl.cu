@@ -89,7 +89,7 @@ void rotateMeshZ(STLMesh& mesh, float angle_deg) {
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv) {
     // Defaults
-    std::string stl_path = "D:\\st_lbm\\LIDMaster\\DILMaster\\tools\\capsule.stl";
+    std::string stl_path = "../../tools/capsule.stl";
     int nx=384, ny=128, nz=128;
     float tau = 0.8f;
     float U0 = 0.05f; // Object velocity
