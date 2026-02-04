@@ -108,6 +108,9 @@ target_include_directories(ibm_sphere_translate3d PRIVATE
     ${CMAKE_SOURCE_DIR}/src/physics/lbm/cuda
 )
 target_compile_definitions(ibm_sphere_translate3d PRIVATE IBM_TESTING)
+
+
+
 target_compile_definitions(ibm_couette3d PRIVATE IBM_TESTING)
 set_target_properties(ibm_couette3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
