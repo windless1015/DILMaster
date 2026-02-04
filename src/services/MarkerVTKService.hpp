@@ -5,21 +5,17 @@
 
 class StepContext;
 
-class VTKService : public IService {
+class MarkerVTKService : public IService {
 public:
   struct Config {
     std::string output_dir = "output";
-    int interval = 100;
-    std::vector<std::string> fields; // 通用标量/向量字段名
-    int nx = 1;
-    int ny = 1;
-    int nz = 1;
-    float dx = 1.0f;  // Grid spacing for VTK output
-    bool binary = true; // Default to binary for performance
+    int interval = 10;
+    std::string marker_field = "ibm.markers";
+    bool binary = true;
   };
 
-  explicit VTKService(const Config &config);
-  ~VTKService() override;
+  explicit MarkerVTKService(const Config &config);
+  ~MarkerVTKService() override;
 
   void initialize(const StepContext &ctx) override;
   void onStepBegin(StepContext &ctx) override {}
@@ -27,7 +23,7 @@ public:
   void finalize(const StepContext &ctx) override;
 
 private:
-  void writeVTIFile(const StepContext &ctx);
+  void writeVTPFile(const StepContext &ctx);
 
   Config config_;
   bool initialized_ = false;
