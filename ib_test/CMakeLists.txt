@@ -125,18 +125,18 @@ target_link_libraries(test_ibm_mdf PRIVATE
 gtest_discover_tests(test_ibm_mdf)
 
 # ==========================================
-# STL Capsule Drag 3D Example
+# STL Capsule 3D Translate Example
 # ==========================================
-add_executable(ibm_capsule_drag3d_stl 
-    ibm_capsule_drag3d_stl.cu 
+add_executable(ibm_capsule3d_st_translate 
+    ibm_capsule3d_st_translate.cu 
     ../src/physics/ibm/IBMCore.cu
     ../src/geometry/STLGeometryLoader.cpp
     ../src/services/VTKService.cpp
     ../src/services/MarkerVTKService.cpp
 )
-set_target_properties(ibm_capsule_drag3d_stl PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
-target_link_libraries(ibm_capsule_drag3d_stl PRIVATE physics services ${CUDA_LIBRARIES})
-target_include_directories(ibm_capsule_drag3d_stl PRIVATE 
+set_target_properties(ibm_capsule3d_st_translate PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
+target_link_libraries(ibm_capsule3d_st_translate PRIVATE physics services ${CUDA_LIBRARIES})
+target_include_directories(ibm_capsule3d_st_translate PRIVATE 
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/physics
     ${CMAKE_SOURCE_DIR}/src/physics/lbm
@@ -145,5 +145,5 @@ target_include_directories(ibm_capsule_drag3d_stl PRIVATE
     ${CMAKE_SOURCE_DIR}/src/services
     ${CMAKE_SOURCE_DIR}/src/core
 )
-target_compile_definitions(ibm_capsule_drag3d_stl PRIVATE IBM_TESTING)
+target_compile_definitions(ibm_capsule3d_st_translate PRIVATE IBM_TESTING)
 
