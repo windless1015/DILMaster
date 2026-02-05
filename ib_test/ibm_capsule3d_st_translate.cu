@@ -91,12 +91,12 @@ int main(int argc, char** argv) {
     // Defaults
     std::string stl_path = "../../tools/capsule.stl";
     int nx=384, ny=128, nz=128;
-    float tau = 0.8f;
-    float U0 = 0.05f; // Object velocity
-    float spacing_req = 1.0f;
+    float tau = 1.1f; // User requested 1.1 (high viscosity/damping)
+    float U0 = 0.02f;
+    float spacing_req = 1.0f; // User requested 1.0 (dense markers)
     
-    int mdf_iter = 5;
-    float beta = 0.5f;
+    int mdf_iter = 2; // User requested 2 (stable)
+    float beta = 0.05f; // User requested 0.05 (stable)
     float angle = 0.0f;
     float scale = 1.0f;
     int steps = 10000;
@@ -265,6 +265,23 @@ int main(int argc, char** argv) {
         lbm.setExternalForceFromDeviceAoS(d_force);
         lbm.streamCollide();
         lbm.updateMacroscopic();
+
+        // [New Diagnostic]
+        if (pre % 10 == 0) {
+            std::vector<float3> m_forces(nMarkers);
+            ibm.downloadForces(m_forces.data());
+            double fx_m = 0, fy_m = 0;
+            for(const auto& f : m_forces) { fx_m += f.x; fy_m += f.y; }
+            double drag_m = -fx_m;
+
+            std::cout << "[Pre-Relax] Step " << pre << ": Drag=" << std::scientific << drag_m 
+                      << " Ramp=" << std::fixed << std::setprecision(2) << ramp_factor << std::endl;
+
+            if (std::isnan(drag_m) || std::abs(drag_m) > 1e6) {
+                std::cerr << "EXPLOSION DETECTED at step " << pre << " during pre-relaxation!" << std::endl;
+                break;
+            }
+        }
     }
     std::cout << "Pre-relaxation complete. Starting simulation..." << std::endl;
 
@@ -320,40 +337,119 @@ int main(int argc, char** argv) {
             
             log_csv << t << "," << center.x << "," << drag_m << "," << lift_m << "," << Re << "," << (moving ? 1 : 0) << "\n";
 
-            // Output via Services
+            // OUTPUT via SERVICES
             if (t > 0 && t % output_every == 0) {
+                std::cout << "\n========== data flow probe starts [Step " << t << "] ==========" << std::endl;
+                
+                // 1. 检查GPU指针
+                const float* d_rho = lbm.getDensityField();
                 float3* u_aos = lbm.velocityAoSPtr();
+                std::cout << "[GPU pointer check] d_rho = " << d_rho << ", u_aos = " << u_aos << std::endl;
+                if (!d_rho || !u_aos) {
+                    std::cerr << "ERROR: GPU pointer is null!" << std::endl;
+                    continue;
+                }
 
                 // A. Fluid Fields
                 auto h_rho = fields.create({ "Density", (size_t)nx * ny * nz, sizeof(float) });
-                CHECK_CUDA(cudaMemcpy(h_rho.data(), lbm.getDensityField(), nx * ny * nz * sizeof(float), cudaMemcpyDeviceToHost));
-
                 auto h_u = fields.create({ "Velocity", (size_t)nx * ny * nz, sizeof(float) * 3 });
-                CHECK_CUDA(cudaMemcpy(h_u.data(), u_aos, nx * ny * nz * sizeof(float3), cudaMemcpyDeviceToHost));
+                
+                // 2. 执行数据拷贝
+                cudaError_t err_rho = cudaMemcpy(h_rho.data(), d_rho, nx * ny * nz * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaError_t err_u = cudaMemcpy(h_u.data(), u_aos, nx * ny * nz * sizeof(float3), cudaMemcpyDeviceToHost);
+                
+                if (err_rho != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaMemcpy Density failed: " << cudaGetErrorString(err_rho) << std::endl;
+                }
+                if (err_u != cudaSuccess) {
+                    std::cerr << "[ERROR] cudaMemcpy Velocity failed: " << cudaGetErrorString(err_u) << std::endl;
+                }
 
-                // Speed
+                // 3. 数据抽样验证
+                float* rho_data = (float*)h_rho.data();
+                float3* u_data = (float3*)h_u.data();
+                
+                // 抽样点: 中心点
+                int center_idx = (nz/2) * nx * ny + (ny/2) * nx + (nx/2);
+                // 抽样点: (0,0,0)
+                int origin_idx = 0;
+                // 抽样点: (nx-1, ny-1, nz-1)
+                int corner_idx = (nz-1) * nx * ny + (ny-1) * nx + (nx-1);
+                
+                std::cout << "\n[data sampling ]" << std::endl;
+                std::cout << " center point[" << center_idx << "]: "
+                          << "rho=" << rho_data[center_idx] 
+                          << ", u=(" << u_data[center_idx].x << ", " 
+                          << u_data[center_idx].y << ", " 
+                          << u_data[center_idx].z << ")" << std::endl;
+                std::cout << "  origin[0]: "
+                          << "rho=" << rho_data[origin_idx] 
+                          << ", u=(" << u_data[origin_idx].x << ", " 
+                          << u_data[origin_idx].y << ", " 
+                          << u_data[origin_idx].z << ")" << std::endl;
+                std::cout << "  duijiaodian[" << corner_idx << "]: "
+                          << "rho=" << rho_data[corner_idx] 
+                          << ", u=(" << u_data[corner_idx].x << ", " 
+                          << u_data[corner_idx].y << ", " 
+                          << u_data[corner_idx].z << ")" << std::endl;
+
+                // 4. 速度场全红诊断 - 检查是否为0、NaN或极大值
+                int zero_count = 0, nan_count = 0, large_count = 0;
+                float max_speed = 0.0f, min_speed = 1e10f, avg_speed = 0.0f;
+                
+                for (int i = 0; i < nx * ny * nz; ++i) {
+                    float speed_i = sqrtf(u_data[i].x * u_data[i].x + 
+                                          u_data[i].y * u_data[i].y + 
+                                          u_data[i].z * u_data[i].z);
+                    if (speed_i == 0.0f) zero_count++;
+                    if (std::isnan(speed_i)) nan_count++;
+                    if (speed_i > 1.0f) large_count++;  // 超过1认为是极大值
+                    if (speed_i > max_speed) max_speed = speed_i;
+                    if (speed_i < min_speed) min_speed = speed_i;
+                    avg_speed += speed_i;
+                }
+                avg_speed /= (nx * ny * nz);
+                
+                std::cout << "\n[volocity probe]" << std::endl;
+                std::cout << "  Zero Number: " << zero_count << "/" << (nx*ny*nz) << std::endl;
+                std::cout << "  NaN number: " << nan_count << "/" << (nx*ny*nz) << std::endl;
+                std::cout << "  jidazhi number: " << large_count << "/" << (nx*ny*nz) << std::endl;
+                std::cout << "  Vecolity Range: [" << min_speed << ", " << max_speed << "], average: " << avg_speed << std::endl;
+
+                // 5. 计算Speed字段
                 std::vector<float> speed(nx * ny * nz);
-                float3* cpu_u_ptr = (float3*)h_u.data();
-                for (int i = 0; i < nx * ny * nz; ++i) speed[i] = sqrtf(cpu_u_ptr[i].x * cpu_u_ptr[i].x + cpu_u_ptr[i].y * cpu_u_ptr[i].y + cpu_u_ptr[i].z * cpu_u_ptr[i].z);
+                for (int i = 0; i < nx * ny * nz; ++i) {
+                    speed[i] = sqrtf(u_data[i].x * u_data[i].x + 
+                                     u_data[i].y * u_data[i].y + 
+                                     u_data[i].z * u_data[i].z);
+                }
                 auto h_speed = fields.create({ "Speed", (size_t)nx * ny * nz, sizeof(float) });
                 memcpy(h_speed.data(), speed.data(), speed.size() * sizeof(float));
 
                 // B. Marker Fields
                 auto h_mk = fields.create({ "ibm.markers", nMarkers, sizeof(float) * 3 });
                 memcpy(h_mk.data(), h_pos.data(), nMarkers * sizeof(float) * 3);
-
                 auto h_mv = fields.create({ "ibm.velocity", nMarkers, sizeof(float) * 3 });
                 memcpy(h_mv.data(), h_vel.data(), nMarkers * sizeof(float) * 3);
-
                 auto h_mf = fields.create({ "ibm.force", nMarkers, sizeof(float) * 3 });
                 memcpy(h_mf.data(), m_forces.data(), nMarkers * sizeof(float) * 3);
-
                 auto h_ma = fields.create({ "ibm.area", nMarkers, sizeof(float) });
                 memcpy(h_ma.data(), area_vec.data(), nMarkers * sizeof(float));
+
+                // 6. FieldStore状态检查
+                std::cout << "\n[FieldStore status check]" << std::endl;
+                std::vector<std::string> field_names = fields.names();
+                std::cout << "  created fields number: " << field_names.size() << std::endl;
+                for (const auto& name : field_names) {
+                    auto h = fields.get(name);
+                    std::cout << "    - " << name << ": " << h.size_bytes() << " bytes" << std::endl;
+                }
 
                 // CALL SERVICES
                 vtk_svc.onStepEnd(ctx);
                 marker_svc.onStepEnd(ctx);
+                
+                std::cout << "========== finish ==========\n" << std::endl;
             }
         }
     }
