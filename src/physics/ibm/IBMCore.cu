@@ -7,8 +7,10 @@
  */
 
 #include "IBMCore.hpp"
+#include "IBMCore.hpp"
 #include <cmath>
 #include <cstdio>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -471,6 +473,32 @@ void IBMBackend::free_memory() {
 void IBMBackend::initialize(const IBMParams &params) {
     if (allocated_) free_memory();
     params_ = params;
+    
+    // ========== Parameter Validation ==========
+    // 1. Beta sign check - CRITICAL for correct force direction
+    if (params_.mdf_beta > 0) {
+        std::cerr << "[IBM WARNING] mdf_beta > 0 detected (" << params_.mdf_beta 
+                  << "). This typically causes INVERTED wake (appearing in FRONT of object)!\n"
+                  << "             Recommended: Use negative beta (e.g., -0.5).\n";
+    }
+    
+    // 2. Beta magnitude check
+    if (std::abs(params_.mdf_beta) < 0.1f) {
+        std::cerr << "[IBM WARNING] |mdf_beta| < 0.1 (" << params_.mdf_beta 
+                  << "). Coupling may be too weak to produce visible flow response.\n"
+                  << "             Recommended: |beta| = 0.3 ~ 0.8.\n";
+    }
+    
+    // 3. Iteration count check
+    if (params_.mdf_iterations < 3) {
+        std::cerr << "[IBM WARNING] mdf_iterations = " << params_.mdf_iterations 
+                  << " (< 3). Coupling may be too loose.\n"
+                  << "             Recommended: 3 ~ 10 iterations.\n";
+    }
+    
+    // Note: ds/dx check requires marker spacing info, which is not in IBMParams.
+    // This should be checked at the application level where spacing is known.
+    
     allocate_memory();
     
     if (position_) CUDA_CHECK(cudaMemset(position_, 0, params_.nMarkers * sizeof(float3)));
