@@ -91,12 +91,12 @@ int main(int argc, char** argv) {
     // Defaults
     std::string stl_path = "../../tools/capsule.stl";
     int nx=384, ny=128, nz=128;
-    float tau = 1.1f; // User requested 1.1 (high viscosity/damping)
-    float U0 = 0.02f;
+    float tau = 0.8f; // Match sphere example
+    float U0 = 0.05f;  // Positive, move RIGHT (like sphere)
     float spacing_req = 1.0f; // User requested 1.0 (dense markers)
     
-    int mdf_iter = 2; // User requested 2 (stable)
-    float beta = 0.05f; // User requested 0.05 (stable)
+    int mdf_iter = 5;   // Match sphere example (was 2)
+    float beta = -0.5f;  // Match sphere example (was -0.05)
     float angle = 0.0f;
     float scale = 1.0f;
     int steps = 10000;
@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
     lbm_cfg.tau = tau;
     lbm_cfg.enableFreeSurface = false;
     lbm_cfg.collisionModel = lbm::CollisionModel::SRT;
-    lbm_cfg.bcXMin = lbm::BC_PERIODIC; lbm_cfg.bcXMax = lbm::BC_PERIODIC;
+    lbm_cfg.bcXMin = lbm::BC_BOUNCE_BACK; lbm_cfg.bcXMax = lbm::BC_BOUNCE_BACK; // Walls at X
     lbm_cfg.bcYMin = lbm::BC_PERIODIC; lbm_cfg.bcYMax = lbm::BC_PERIODIC;
     lbm_cfg.bcZMin = lbm::BC_PERIODIC; lbm_cfg.bcZMax = lbm::BC_PERIODIC;
     lbm_cfg.gravity = make_float3(0,0,0); // No body force, object moves
@@ -203,9 +203,9 @@ int main(int argc, char** argv) {
 
     ibm::IBMCore ibm(ibm_p);
 
-    // 5. Buffers
+    // 5. Buffers - Start capsule at LEFT side (25%), moving RIGHT
     float3 center = make_float3(nx * 0.25f, ny * 0.5f, nz * 0.5f);
-    float3 U_obj = make_float3(U0, 0.0f, 0.0f);
+    float3 U_obj = make_float3(U0, 0.0f, 0.0f); // U0 > 0 for right movement
 
     std::vector<float3> h_pos(nMarkers);
     std::vector<float3> h_vel(nMarkers);
@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
 
     // 7. Pre-relaxation
     std::cout << "Pre-relaxation: 500 steps (200 stationary + 300 ramp-up)..." << std::endl;
-    float3 center_init = make_float3(nx * 0.25f, ny * 0.5f, nz * 0.5f);
+    float3 center_init = make_float3(nx * 0.25f, ny * 0.5f, nz * 0.5f); // Match main loop
     for (int pre = 0; pre < 500; ++pre) {
         float ramp_factor = (pre < 200) ? 0.0f : (pre - 200) / 300.0f;
         float3 current_vel = make_float3(U0 * ramp_factor, 0.0f, 0.0f);
@@ -292,7 +292,7 @@ int main(int argc, char** argv) {
 
         // A. Move Capsule
         bool moving = true;
-        if (center.x > 0.8f * nx) {
+        if (center.x > 0.8f * nx) { // Stop when capsule reaches 80% of domain (right side)
             moving = false;
             U_obj = make_float3(0, 0, 0);
             for (auto& v : h_vel) v = U_obj;
