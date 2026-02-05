@@ -178,6 +178,7 @@ private:
   
   // Debug / Stats
   unsigned int *d_fallback_count_ = nullptr; // Fallback 计数器
+  unsigned int *d_health_flags_ = nullptr;   // 健康状态标志 (0=OK, 1=NaN, 2=Explosion)
 
   // 内部辅助方法
   void allocate_memory();

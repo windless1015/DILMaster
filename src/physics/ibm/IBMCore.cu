@@ -298,7 +298,8 @@ __global__ void compute_correction_force(const float3 *marker_vel,
                                          float3 *accum_force, 
                                          float dt,
                                          float beta,
-                                         int nMarkers) {
+                                         int nMarkers,
+                                         unsigned int *health_flags) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= nMarkers) return;
     
@@ -314,6 +315,14 @@ __global__ void compute_correction_force(const float3 *marker_vel,
   df.x = factor * (u_t.x - u_i.x);
   df.y = factor * (u_t.y - u_i.y);
   df.z = factor * (u_t.z - u_i.z);
+
+  // Stability Check
+  float mag_sq = df.x*df.x + df.y*df.y + df.z*df.z;
+  if (isnan(mag_sq) || isinf(mag_sq)) {
+      if (health_flags) atomicExch(health_flags, 1); // 1 = NaN
+  } else if (mag_sq > 1.0e12f) { // Force > 1e6
+      if (health_flags) atomicExch(health_flags, 2); // 2 = Explosion
+  }
   
   delta_force[i] = df;
   
@@ -426,6 +435,7 @@ void IBMBackend::allocate_memory() {
   
   // Debug Counter
   CUDA_CHECK(cudaMalloc(&d_fallback_count_, sizeof(unsigned int)));
+  CUDA_CHECK(cudaMalloc(&d_health_flags_, sizeof(unsigned int)));
 
   // Grid Buffer
   size_t nCells = params_.nx * params_.ny * params_.nz;
@@ -444,6 +454,7 @@ void IBMBackend::free_memory() {
   if (delta_force_) cudaFree(delta_force_);
   if (temp_fluid_velocity_) cudaFree(temp_fluid_velocity_);
   if (d_fallback_count_) cudaFree(d_fallback_count_);
+  if (d_health_flags_) cudaFree(d_health_flags_);
   
   position_ = nullptr;
   velocity_ = nullptr;
@@ -454,6 +465,7 @@ void IBMBackend::free_memory() {
   delta_force_ = nullptr;
   temp_fluid_velocity_ = nullptr;
   d_fallback_count_ = nullptr;
+  d_health_flags_ = nullptr;
 }
 
 void IBMBackend::initialize(const IBMParams &params) {
@@ -467,6 +479,7 @@ void IBMBackend::initialize(const IBMParams &params) {
     if (area_) CUDA_CHECK(cudaMemset(area_, 0, params_.nMarkers * sizeof(float)));
     if (interpolated_density_) CUDA_CHECK(cudaMemset(interpolated_density_, 0, params_.nMarkers * sizeof(float)));
     if (d_fallback_count_) CUDA_CHECK(cudaMemset(d_fallback_count_, 0, sizeof(unsigned int)));
+    if (d_health_flags_) CUDA_CHECK(cudaMemset(d_health_flags_, 0, sizeof(unsigned int)));
     allocated_ = true;
 }
 
@@ -524,6 +537,7 @@ void IBMBackend::computeForces(const float3 *fluid_velocity, const float *fluid_
    }
    
    // 3. MDF 迭代
+   // 3. MDF 迭代
    for (int k = 0; k < params_.mdf_iterations; ++k) {
        // A. 插值 (From current u_pred)
        interpolateVelocity(temp_fluid_velocity_, valid_mask);
@@ -533,8 +547,21 @@ void IBMBackend::computeForces(const float3 *fluid_velocity, const float *fluid_
            velocity_, interpolated_velocity_, area_, 
            (fluid_density ? interpolated_density_ : nullptr), 
            delta_force_, force_,
-           dt, params_.mdf_beta, (int)params_.nMarkers
+           dt, params_.mdf_beta, (int)params_.nMarkers,
+           d_health_flags_
        );
+       
+       // Stability Check (Host)
+       if (d_health_flags_) {
+           unsigned int h_flags = 0;
+           CUDA_CHECK(cudaMemcpy(&h_flags, d_health_flags_, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+           if (h_flags != 0) {
+                 std::string msg = "[IBM ERROR] Simulation Instability Detected! ";
+                 if (h_flags == 1) msg += "NaN values in IBM force calculation.";
+                 if (h_flags == 2) msg += "Force Explosion (Magnitude > 1e6). Beta too high?";
+                 throw std::runtime_error(msg);
+           }
+       }
        
        // C. Spread
        spreadForce(delta_force_, fluid_force_out, valid_mask, fill_fraction);
