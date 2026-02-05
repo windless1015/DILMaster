@@ -340,9 +340,15 @@ int main(int argc, char** argv) {
     // =========================================================================
     // 8. Main Simulation Loop
     // =========================================================================
+    int last_output_step = -1;
     for(int t=0; t<=steps; ++t) {
         ctx.step = t;
         ctx.time = t * 1.0;
+        
+        // Progress output every 1000 steps
+        if (t % 1000 == 0 && t > 0) {
+            std::cout << "[Progress] Step " << t << "/" << steps << " (" << (100.0f*t/steps) << "%)" << std::endl;
+        }
 
         // A. Move Capsule
         bool moving = true;
@@ -374,6 +380,15 @@ int main(int argc, char** argv) {
         lbm.streamCollide();              // <- LBM streaming + collision
         fsModule.postStream(ctx);         // <- Mass update + interface transitions
         lbm.updateMacroscopic();
+        
+        // CUDA Error Check - Sync and detect any kernel errors
+        cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            std::cerr << "[CUDA ERROR] at step " << t << ": " << cudaGetErrorString(err) << std::endl;
+            break;
+        }
+        
+        last_output_step = t;  // Track last successful step
 
         // E. Diagnostics & Output
         if (t % 100 == 0) {
@@ -395,50 +410,62 @@ int main(int argc, char** argv) {
 
             // OUTPUT via SERVICES
             if (t > 0 && t % output_every == 0) {
-                 auto h_rho = fields.create({ "Density", (size_t)nx * ny * nz, sizeof(float) });
-                 auto h_u = fields.create({ "Velocity", (size_t)nx * ny * nz, sizeof(float) * 3 });
-                 
-                 const float* d_rho = lbm.getDensityField();
-                 float3* u_aos = lbm.velocityAoSPtr();
-                 
-                 cudaMemcpy(h_rho.data(), d_rho, nx * ny * nz * sizeof(float), cudaMemcpyDeviceToHost);
-                 cudaMemcpy(h_u.data(), u_aos, nx * ny * nz * sizeof(float3), cudaMemcpyDeviceToHost);
+                try {
+                     auto h_rho = fields.create({ "Density", (size_t)nx * ny * nz, sizeof(float) });
+                     auto h_u = fields.create({ "Velocity", (size_t)nx * ny * nz, sizeof(float) * 3 });
+                     
+                     const float* d_rho = lbm.getDensityField();
+                     float3* u_aos = lbm.velocityAoSPtr();
+                     
+                     cudaMemcpy(h_rho.data(), d_rho, nx * ny * nz * sizeof(float), cudaMemcpyDeviceToHost);
+                     cudaMemcpy(h_u.data(), u_aos, nx * ny * nz * sizeof(float3), cudaMemcpyDeviceToHost);
 
-                 // Speed
-                 std::vector<float> speed(nx * ny * nz);
-                 float3* cpu_u_ptr = (float3*)h_u.data();
-                 for (int i = 0; i < nx * ny * nz; ++i) {
-                      float ux = cpu_u_ptr[i].x;
-                      float uy = cpu_u_ptr[i].y;
-                      float uz = cpu_u_ptr[i].z;
-                      speed[i] = sqrtf(ux*ux + uy*uy + uz*uz);
-                 }
-                 auto h_speed = fields.create({ "Speed", (size_t)nx * ny * nz, sizeof(float) });
-                 memcpy(h_speed.data(), speed.data(), speed.size() * sizeof(float));
+                     // Speed
+                     std::vector<float> speed(nx * ny * nz);
+                     float3* cpu_u_ptr = (float3*)h_u.data();
+                     for (int i = 0; i < nx * ny * nz; ++i) {
+                          float ux = cpu_u_ptr[i].x;
+                          float uy = cpu_u_ptr[i].y;
+                          float uz = cpu_u_ptr[i].z;
+                          speed[i] = sqrtf(ux*ux + uy*uy + uz*uz);
+                     }
+                     auto h_speed = fields.create({ "Speed", (size_t)nx * ny * nz, sizeof(float) });
+                     memcpy(h_speed.data(), speed.data(), speed.size() * sizeof(float));
 
-                 // Fill (Free Surface fill fraction) - using phiDevicePtr()
-                 auto h_fill = fields.create({ "Fill", (size_t)nx * ny * nz, sizeof(float) });
-                 float* d_phi = lbm.phiDevicePtr();
-                 if (d_phi) {
-                     cudaMemcpy(h_fill.data(), d_phi, nx * ny * nz * sizeof(float), cudaMemcpyDeviceToHost);
-                 }
+                     // Fill (Free Surface fill fraction) - using phiDevicePtr()
+                     auto h_fill = fields.create({ "Fill", (size_t)nx * ny * nz, sizeof(float) });
+                     float* d_phi = lbm.phiDevicePtr();
+                     if (d_phi) {
+                         cudaMemcpy(h_fill.data(), d_phi, nx * ny * nz * sizeof(float), cudaMemcpyDeviceToHost);
+                     }
 
-                // Marker Fields
-                auto h_mk = fields.create({ "ibm.markers", nMarkers, sizeof(float) * 3 });
-                memcpy(h_mk.data(), h_pos.data(), nMarkers * sizeof(float) * 3);
-                auto h_mv = fields.create({ "ibm.velocity", nMarkers, sizeof(float) * 3 });
-                memcpy(h_mv.data(), h_vel.data(), nMarkers * sizeof(float) * 3);
-                auto h_mf = fields.create({ "ibm.force", nMarkers, sizeof(float) * 3 });
-                memcpy(h_mf.data(), m_forces.data(), nMarkers * sizeof(float) * 3);
-                auto h_ma = fields.create({ "ibm.area", nMarkers, sizeof(float) });
-                memcpy(h_ma.data(), area_vec.data(), nMarkers * sizeof(float));
+                    // Marker Fields
+                    auto h_mk = fields.create({ "ibm.markers", nMarkers, sizeof(float) * 3 });
+                    memcpy(h_mk.data(), h_pos.data(), nMarkers * sizeof(float) * 3);
+                    auto h_mv = fields.create({ "ibm.velocity", nMarkers, sizeof(float) * 3 });
+                    memcpy(h_mv.data(), h_vel.data(), nMarkers * sizeof(float) * 3);
+                    auto h_mf = fields.create({ "ibm.force", nMarkers, sizeof(float) * 3 });
+                    memcpy(h_mf.data(), m_forces.data(), nMarkers * sizeof(float) * 3);
+                    auto h_ma = fields.create({ "ibm.area", nMarkers, sizeof(float) });
+                    memcpy(h_ma.data(), area_vec.data(), nMarkers * sizeof(float));
 
-                // CALL SERVICES
-                vtk_svc.onStepEnd(ctx);
-                marker_svc.onStepEnd(ctx);
+                    // CALL SERVICES
+                    vtk_svc.onStepEnd(ctx);
+                    marker_svc.onStepEnd(ctx);
+                    
+                    std::cout << "  [VTK written for step " << t << "]" << std::endl;
+                } catch (const std::exception& e) {
+                    std::cerr << "[VTK ERROR] at step " << t << ": " << e.what() << std::endl;
+                }
             }
         }
     }
+    std::cout.flush(); // Ensure output is visible
+    
+    // Final Report
+    std::cout << "\n=== SIMULATION COMPLETED ===" << std::endl;
+    std::cout << "Last step completed: " << last_output_step << "/" << steps << std::endl;
+    std::cout << "Capsule final position: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
     
     // Cleanup
     vtk_svc.finalize(ctx);
