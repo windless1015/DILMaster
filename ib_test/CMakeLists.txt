@@ -147,3 +147,25 @@ target_include_directories(ibm_capsule3d_st_translate PRIVATE
 )
 target_compile_definitions(ibm_capsule3d_st_translate PRIVATE IBM_TESTING)
 
+# ==========================================
+# STL Capsule 3D Translate + Free Surface
+# ==========================================
+add_executable(ibm_capsule3d_st_translate_fs 
+    ibm_capsule3d_st_translate_fs.cu 
+    ../src/physics/ibm/IBMCore.cu
+    ../src/geometry/STLGeometryLoader.cpp
+    ../src/services/VTKService.cpp
+    ../src/services/MarkerVTKService.cpp
+)
+set_target_properties(ibm_capsule3d_st_translate_fs PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
+target_link_libraries(ibm_capsule3d_st_translate_fs PRIVATE physics services ${CUDA_LIBRARIES})
+target_include_directories(ibm_capsule3d_st_translate_fs PRIVATE 
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/physics
+    ${CMAKE_SOURCE_DIR}/src/physics/lbm
+    ${CMAKE_SOURCE_DIR}/src/physics/lbm/cuda
+    ${CMAKE_SOURCE_DIR}/src/geometry
+    ${CMAKE_SOURCE_DIR}/src/services
+    ${CMAKE_SOURCE_DIR}/src/core
+)
+target_compile_definitions(ibm_capsule3d_st_translate_fs PRIVATE IBM_TESTING)
