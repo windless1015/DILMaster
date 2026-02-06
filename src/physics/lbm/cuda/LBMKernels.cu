@@ -167,9 +167,17 @@ __global__ void kernel_update_fields(const __half *fi, float *rho, float *u,
   if (n >= params.N)
     return;
   const unsigned char flagsn = flags[n];
-  if ((flagsn & CellFlag::BOUNDARY_MASK) == CellFlag::SOLID ||
-      (flagsn & CellFlag::SURFACE_MASK) == CellFlag::GAS)
+  if ((flagsn & CellFlag::BOUNDARY_MASK) == CellFlag::SOLID)
     return;
+
+  // Clear Gas Cells
+  if ((flagsn & CellFlag::SURFACE_MASK) == CellFlag::GAS) {
+      rho[n] = 1.0f; 
+      u[n] = 0.0f;
+      u[params.N + n] = 0.0f;
+      u[2ull * params.N + n] = 0.0f;
+      return;
+  }
 
   unsigned long long j[kVelocitySet];
   neighbors(n, params.Nx, params.Ny, params.Nz, j);
