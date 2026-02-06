@@ -156,6 +156,7 @@ add_executable(ibm_capsule3d_st_translate_fs
     ../src/geometry/STLGeometryLoader.cpp
     ../src/services/VTKService.cpp
     ../src/services/MarkerVTKService.cpp
+    diagnostics/free_surface_diagnostics.cuh
 )
 set_target_properties(ibm_capsule3d_st_translate_fs PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
 target_link_libraries(ibm_capsule3d_st_translate_fs PRIVATE physics services ${CUDA_LIBRARIES})
