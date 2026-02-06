@@ -129,6 +129,19 @@ __global__ void kAddGravity(float *force,
 }
 
 // ----------------------------------------------------------------------------
+// Add external forces: F += F_ext
+// ----------------------------------------------------------------------------
+__global__ void kAddExternalForces(float *force,
+                                   const float *ext_force,
+                                   int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    force[i]         += ext_force[i];
+    force[i + N]     += ext_force[i + N];
+    force[i + 2 * N] += ext_force[i + 2 * N];
+}
+
+// ----------------------------------------------------------------------------
 // Compute mass properties from radius + density
 // ----------------------------------------------------------------------------
 __global__ void kComputeMassProperties(const float *radius,
@@ -750,23 +763,26 @@ void DEMCore::configure(const DEMConfig &cfg) {
     contact_capacity_ = cap;
     contact_mask_     = cap - 1;
 
-    // Auto-compute damping from restitution if needed
+    // Auto-compute damping from restitution
     float m_default = sphereMass(cfg_.particle_radius, cfg_.particle_density);
     float m_eff_pp  = m_default * 0.5f;  // effective mass for two equal particles
-    float m_eff_pw  = m_default;          // effective mass for particle-wall
+    float m_eff_pw  = m_default;         // effective mass for particle-wall
 
-    gamma_n_ = cfg_.material.gamma_n;
-    if (gamma_n_ <= 0.0f) {
-        // Use average of pp and pw effective masses
-        float m_eff_avg = (m_eff_pp + m_eff_pw) * 0.5f;
-        gamma_n_ = computeDampingFromRestitution(
-            cfg_.material.restitution, cfg_.material.kn, m_eff_avg);
-    }
+    // Compute separate gammas for Textbook Accuracy
+    gamma_n_pp_ = computeDampingFromRestitution(cfg_.material.restitution, cfg_.material.kn, m_eff_pp);
+    gamma_n_pw_ = computeDampingFromRestitution(cfg_.material.restitution, cfg_.material.kn, m_eff_pw);
 
-    gamma_t_ = cfg_.material.gamma_t;
-    if (gamma_t_ <= 0.0f) {
-        gamma_t_ = gamma_n_;  // default: same as normal damping
-    }
+    // Default tangential damping to same as normal if not specified
+    gamma_t_pp_ = gamma_n_pp_;
+    gamma_t_pw_ = gamma_n_pw_;
+    
+    // Critical time step
+    float t_osc = 3.14159f * std::sqrt(m_eff_pp / cfg_.material.kn);
+    t_critical_ = t_osc;
+    mass_min_ = m_default;
+    
+    printf("[DEMCore Config] e=%.3f, kn=%.1e\n", cfg_.material.restitution, cfg_.material.kn);
+    printf("                 m_pp=%.2e, gamma_pp=%.2e, t_c=%.2e\n", m_eff_pp, gamma_n_pp_, t_critical_);
 }
 
 void DEMCore::allocate() {
@@ -837,10 +853,13 @@ void DEMCore::freeMemory() {
     safe_free(reinterpret_cast<void*&>(d_sorted_idx_));
     safe_free(reinterpret_cast<void*&>(d_cell_start_));
     safe_free(reinterpret_cast<void*&>(d_cell_end_));
-    safe_free(reinterpret_cast<void*&>(d_contacts_old_));
-    safe_free(reinterpret_cast<void*&>(d_contacts_new_));
-    safe_free(reinterpret_cast<void*&>(d_diag_));
-    safe_free(reinterpret_cast<void*&>(d_diag_max_overlap_));
+    if (d_contacts_old_) cudaFree(d_contacts_old_); d_contacts_old_ = nullptr;
+    if (d_contacts_new_) cudaFree(d_contacts_new_); d_contacts_new_ = nullptr;
+    if (d_diag_)         cudaFree(d_diag_);         d_diag_ = nullptr; 
+    if (d_diag_max_overlap_) cudaFree(d_diag_max_overlap_); d_diag_max_overlap_ = nullptr;
+    
+    if (d_ext_force_)    cudaFree(d_ext_force_);    d_ext_force_ = nullptr;
+
     allocated_ = false;
 }
 
@@ -860,11 +879,26 @@ void DEMCore::uploadAngularVelocities(const float *h) {
     CUDA_CHECK(cudaMemcpy(d_omega_, h, 3 * cfg_.num_particles * sizeof(float),
                           cudaMemcpyHostToDevice));
 }
-void DEMCore::uploadRadii(const float *h) {
-    CUDA_CHECK(cudaMemcpy(d_radius_, h, cfg_.num_particles * sizeof(float),
-                          cudaMemcpyHostToDevice));
+void DEMCore::uploadRadii(const float *radii_h) {
+    if (!allocated_) allocate();
+    CUDA_CHECK(cudaMemcpy(d_radius_, radii_h, cfg_.num_particles * sizeof(float), cudaMemcpyHostToDevice));
 }
 
+void DEMCore::uploadExternalForces(const float *forces_h) {
+    std::size_t N = cfg_.num_particles;
+    if (N == 0) return;
+    if (d_ext_force_ == nullptr) {
+        CUDA_CHECK(cudaMalloc(&d_ext_force_, 3 * N * sizeof(float)));
+    }
+    CUDA_CHECK(cudaMemcpy(d_ext_force_, forces_h, 3 * N * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+void DEMCore::clearExternalForces() {
+    if (d_ext_force_) {
+        std::size_t N = cfg_.num_particles;
+        CUDA_CHECK(cudaMemset(d_ext_force_, 0, 3 * N * sizeof(float)));
+    }
+}
 void DEMCore::downloadPositions(float *h) const {
     CUDA_CHECK(cudaMemcpy(h, d_pos_, 3 * cfg_.num_particles * sizeof(float),
                           cudaMemcpyDeviceToHost));
@@ -905,34 +939,46 @@ void DEMCore::initMassProperties() {
 // ========================================================================
 
 void DEMCore::step(float dt) {
-    if (!allocated_ || cfg_.num_particles == 0) return;
+    if (!allocated_) return;
 
-    // 1. Clear force/torque
-    clearForcesTorque();
+    // 1. Clear accumulators
+    int N = static_cast<int>(cfg_.num_particles);
+    int threads = 128;
+    int blocks = (N + threads - 1) / threads;
+    kClearForcesTorque<<<blocks, threads>>>(d_force_, d_torque_, N);
 
-    // 2. Add gravity
-    addGravity();
+    // 2. Add Gravity
+    if (cfg_.gravity_x != 0 || cfg_.gravity_y != 0 || cfg_.gravity_z != 0) {
+        kAddGravity<<<blocks, threads>>>(d_force_, d_mass_,
+                                         cfg_.gravity_x, cfg_.gravity_y, cfg_.gravity_z,
+                                         N);
+    }
+    
+    // 3. Add External Forces (if present)
+    if (d_ext_force_) {
+        kAddExternalForces<<<blocks, threads>>>(d_force_, d_ext_force_, N);
+    }
 
-    // 3. Build spatial grid (broad phase)
+    // 4. Broad Phase
     if (!cfg_.use_naive_n2) {
         buildSpatialGrid();
     }
 
-    // 4. Swap contact tables (old <- new; clear new)
+    // 5. Swap contact tables (old <- new; clear new)
     swapContactTables();
 
-    // 5. Particle-particle contacts
+    // 6. Particle-particle contacts
     if (cfg_.num_particles > 1) {
         computeParticleContacts(dt);
     }
 
-    // 6. Wall contacts
+    // 7. Wall contacts
     computeWallContacts(dt);
 
-    // 7. Integrate
+    // 8. Integrate
     integrateSymplecticEuler(dt);
 
-    // 8. Diagnostics
+    // 9. Diagnostics
     gatherDiagnostics();
 
     ++step_count_;
@@ -976,6 +1022,11 @@ void DEMCore::buildSpatialGrid() {
 
     int threads = 256;
     int blocks  = (N + threads - 1) / threads;
+
+    printf("[DEMCore::buildSpatialGrid] N=%d blocks=%d threads=%d cell_size=%.4e grid=(%d,%d,%d)\n",
+           N, blocks, threads, cell_size_, grid_nx_, grid_ny_, grid_nz_);
+    printf("d_pos=%p d_cell_id=%p\n", d_pos_, d_cell_id_);
+    fflush(stdout);
 
     // 1. Compute cell_id and initialize sorted_idx = identity
     kComputeCellId<<<blocks, threads>>>(
@@ -1026,8 +1077,8 @@ void DEMCore::computeParticleContacts(float dt) {
         int blocks = (N + 127) / 128;
         kComputeCollisionsNaive<<<blocks, 128>>>(
             d_pos_, d_vel_, d_omega_, d_force_, d_torque_, d_radius_,
-            cfg_.material.kn, gamma_n_, cfg_.material.mu,
-            cfg_.material.kt, gamma_t_, dt, N);
+            cfg_.material.kn, gamma_n_pp_, cfg_.material.mu,
+            cfg_.material.kt, gamma_t_pp_, dt, N);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1042,7 +1093,7 @@ void DEMCore::computeParticleContacts(float dt) {
         cfg_.domain_min_x, cfg_.domain_min_y, cfg_.domain_min_z,
         d_contacts_old_, d_contacts_new_, contact_mask_,
         cfg_.material.kn, cfg_.material.kt,
-        gamma_n_, gamma_t_, cfg_.material.mu,
+        gamma_n_pp_, gamma_t_pp_, cfg_.material.mu,
         dt,
         &d_diag_[0], d_diag_max_overlap_);
     CUDA_CHECK(cudaGetLastError());
@@ -1057,7 +1108,7 @@ void DEMCore::computeWallContacts(float dt) {
         cfg_.domain_max_x, cfg_.domain_max_y, cfg_.domain_max_z,
         d_contacts_old_, d_contacts_new_, contact_mask_,
         cfg_.material.kn, cfg_.material.kt,
-        gamma_n_, gamma_t_, cfg_.material.mu,
+        gamma_n_pw_, gamma_t_pw_, cfg_.material.mu,
         dt,
         &d_diag_[1], d_diag_max_overlap_);
     CUDA_CHECK(cudaGetLastError());
