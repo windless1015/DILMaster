@@ -129,6 +129,19 @@ __global__ void kAddGravity(float *force,
 }
 
 // ----------------------------------------------------------------------------
+// Add external forces: F += F_ext
+// ----------------------------------------------------------------------------
+__global__ void kAddExternalForces(float *force,
+                                   const float *ext_force,
+                                   int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    force[i]         += ext_force[i];
+    force[i + N]     += ext_force[i + N];
+    force[i + 2 * N] += ext_force[i + 2 * N];
+}
+
+// ----------------------------------------------------------------------------
 // Compute mass properties from radius + density
 // ----------------------------------------------------------------------------
 __global__ void kComputeMassProperties(const float *radius,
@@ -840,10 +853,13 @@ void DEMCore::freeMemory() {
     safe_free(reinterpret_cast<void*&>(d_sorted_idx_));
     safe_free(reinterpret_cast<void*&>(d_cell_start_));
     safe_free(reinterpret_cast<void*&>(d_cell_end_));
-    safe_free(reinterpret_cast<void*&>(d_contacts_old_));
-    safe_free(reinterpret_cast<void*&>(d_contacts_new_));
-    safe_free(reinterpret_cast<void*&>(d_diag_));
-    safe_free(reinterpret_cast<void*&>(d_diag_max_overlap_));
+    if (d_contacts_old_) cudaFree(d_contacts_old_); d_contacts_old_ = nullptr;
+    if (d_contacts_new_) cudaFree(d_contacts_new_); d_contacts_new_ = nullptr;
+    if (d_diag_)         cudaFree(d_diag_);         d_diag_ = nullptr; 
+    if (d_diag_max_overlap_) cudaFree(d_diag_max_overlap_); d_diag_max_overlap_ = nullptr;
+    
+    if (d_ext_force_)    cudaFree(d_ext_force_);    d_ext_force_ = nullptr;
+
     allocated_ = false;
 }
 
@@ -863,11 +879,26 @@ void DEMCore::uploadAngularVelocities(const float *h) {
     CUDA_CHECK(cudaMemcpy(d_omega_, h, 3 * cfg_.num_particles * sizeof(float),
                           cudaMemcpyHostToDevice));
 }
-void DEMCore::uploadRadii(const float *h) {
-    CUDA_CHECK(cudaMemcpy(d_radius_, h, cfg_.num_particles * sizeof(float),
-                          cudaMemcpyHostToDevice));
+void DEMCore::uploadRadii(const float *radii_h) {
+    if (!allocated_) allocate();
+    CUDA_CHECK(cudaMemcpy(d_radius_, radii_h, cfg_.num_particles * sizeof(float), cudaMemcpyHostToDevice));
 }
 
+void DEMCore::uploadExternalForces(const float *forces_h) {
+    std::size_t N = cfg_.num_particles;
+    if (N == 0) return;
+    if (d_ext_force_ == nullptr) {
+        CUDA_CHECK(cudaMalloc(&d_ext_force_, 3 * N * sizeof(float)));
+    }
+    CUDA_CHECK(cudaMemcpy(d_ext_force_, forces_h, 3 * N * sizeof(float), cudaMemcpyHostToDevice));
+}
+
+void DEMCore::clearExternalForces() {
+    if (d_ext_force_) {
+        std::size_t N = cfg_.num_particles;
+        CUDA_CHECK(cudaMemset(d_ext_force_, 0, 3 * N * sizeof(float)));
+    }
+}
 void DEMCore::downloadPositions(float *h) const {
     CUDA_CHECK(cudaMemcpy(h, d_pos_, 3 * cfg_.num_particles * sizeof(float),
                           cudaMemcpyDeviceToHost));
@@ -908,34 +939,46 @@ void DEMCore::initMassProperties() {
 // ========================================================================
 
 void DEMCore::step(float dt) {
-    if (!allocated_ || cfg_.num_particles == 0) return;
+    if (!allocated_) return;
 
-    // 1. Clear force/torque
-    clearForcesTorque();
+    // 1. Clear accumulators
+    int N = static_cast<int>(cfg_.num_particles);
+    int threads = 128;
+    int blocks = (N + threads - 1) / threads;
+    kClearForcesTorque<<<blocks, threads>>>(d_force_, d_torque_, N);
 
-    // 2. Add gravity
-    addGravity();
+    // 2. Add Gravity
+    if (cfg_.gravity_x != 0 || cfg_.gravity_y != 0 || cfg_.gravity_z != 0) {
+        kAddGravity<<<blocks, threads>>>(d_force_, d_mass_,
+                                         cfg_.gravity_x, cfg_.gravity_y, cfg_.gravity_z,
+                                         N);
+    }
+    
+    // 3. Add External Forces (if present)
+    if (d_ext_force_) {
+        kAddExternalForces<<<blocks, threads>>>(d_force_, d_ext_force_, N);
+    }
 
-    // 3. Build spatial grid (broad phase)
+    // 4. Broad Phase
     if (!cfg_.use_naive_n2) {
         buildSpatialGrid();
     }
 
-    // 4. Swap contact tables (old <- new; clear new)
+    // 5. Swap contact tables (old <- new; clear new)
     swapContactTables();
 
-    // 5. Particle-particle contacts
+    // 6. Particle-particle contacts
     if (cfg_.num_particles > 1) {
         computeParticleContacts(dt);
     }
 
-    // 6. Wall contacts
+    // 7. Wall contacts
     computeWallContacts(dt);
 
-    // 7. Integrate
+    // 8. Integrate
     integrateSymplecticEuler(dt);
 
-    // 8. Diagnostics
+    // 9. Diagnostics
     gatherDiagnostics();
 
     ++step_count_;

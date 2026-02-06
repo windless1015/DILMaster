@@ -105,18 +105,12 @@ void DEMSolver::step(StepContext &ctx) {
   // Correct approach per DEMCore.hpp:
   // "Use clearForcesTorquePublic() if coupling code wants to write external forces before step()"
   
+  // 1. Sync Coupling Forces: FieldStore (Host) -> DEMCore (Device)
   auto forceF = ctx.fields->get(DEMFields::FORCE);
   float* h_force = static_cast<float*>(forceF.data());
   
-  // Optional: If coupling is active, we might need to copy these to device
-  // However, standard DEMCore::step() does [Clear -> AddGravity -> BroadPhase -> Contacts...]
-  // If we upload forces now, they will be cleared by step().
-  // 
-  // We need to clarify the interface. For now, assuming standard DEM only.
-  // If coupling is needed later, we'd inject it between Clear and Integrate.
-  // 
-  // Since request says "MVP... no LBM dependencies", we focus on internal DEM physics.
-  // We will pull the latest positions/velocities from GPU to Host for verification/output.
+  // Inject into DEMCore (added in refactor)
+  core_->uploadExternalForces(h_force);
   
   // 2. Execute Physics (Adaptive Substepping)
   // Textbook accuracy requires resolving the contact duration t_c.

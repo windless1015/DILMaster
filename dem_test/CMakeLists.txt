@@ -17,4 +17,15 @@ set_target_properties(dem_test PROPERTIES
 )
 
 # Add test to CTest
+# Add test to CTest
 add_test(NAME dem_test COMMAND dem_test)
+
+# Sedimentation Validation Test
+add_executable(lbm_dem_sedimentation_test
+    lbm_dem_sedimentation/lbm_dem_sedimentation_test.cu
+)
+target_link_libraries(lbm_dem_sedimentation_test PRIVATE physics)
+set_target_properties(lbm_dem_sedimentation_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "60;70;75;80"
+)

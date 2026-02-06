@@ -115,6 +115,7 @@ public:
     void uploadVelocities(const float *vel_h);         ///< 3N floats
     void uploadAngularVelocities(const float *omega_h);///< 3N floats
     void uploadRadii(const float *radii_h);            ///< N floats
+    void uploadExternalForces(const float *forces_h);  ///< 3N floats (optional)
 
     void downloadPositions(float *pos_h)          const; ///< 3N floats
     void downloadVelocities(float *vel_h)         const; ///< 3N floats
@@ -191,7 +192,17 @@ public:
      *
      * Useful when coupling code wants to write external forces before step().
      */
+    /**
+     * @brief Clear force and torque arrays on device.
+     *
+     * Useful when coupling code wants to write external forces before step().
+     */
     void clearForcesTorquePublic();
+    
+    /**
+     * @brief Clear external force array (if allocated).
+     */
+    void clearExternalForces();
 
 private:
     // -- Configuration --
@@ -229,6 +240,7 @@ private:
     float *d_inv_mass_     = nullptr;   // N   1/mass
     float *d_inertia_      = nullptr;   // N   moment of inertia
     float *d_inv_inertia_  = nullptr;   // N   1/inertia
+    float *d_ext_force_    = nullptr;   // 3N  external force (optional, lazy alloc)
 
     // -- Spatial grid buffers --
     unsigned int *d_cell_id_    = nullptr;   // N
