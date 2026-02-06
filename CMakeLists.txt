@@ -46,6 +46,13 @@ set(PHYSICS_SOURCES
   # DEM Sources
   src/physics/dem/DEMCore.cu
   src/physics/dem/DEMSolver.cu
+  # IBM Sources
+  src/physics/ibm/IBMSolver.cu
+  src/physics/ibm/IBMCore.cu
+  src/physics/ibm/IBMMotion.cpp
+  
+  # Geometry
+  src/geometry/STLGeometryLoader.cpp
 )
 
 add_library(physics ${PHYSICS_SOURCES})

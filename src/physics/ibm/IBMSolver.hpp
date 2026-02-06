@@ -195,6 +195,8 @@ struct IBMConfig {
   // IBM 计算参数
   float stencil_width = 2.0f;  // 插值模板宽度（格子单位）
   int interpolation_order = 2; // 插值阶数
+  float mdf_beta = -0.5f;      // MDF 迭代系数 (推荐负值以避免倒置尾流)
+  int mdf_iterations = 3;      // MDF 迭代次数
 
   // 刚体参数（motion_type == RIGID_BODY）
   float mass = 1.0f;              // 刚体质量 [kg]

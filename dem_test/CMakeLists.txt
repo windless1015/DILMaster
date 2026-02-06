@@ -29,3 +29,19 @@ set_target_properties(lbm_dem_sedimentation_test PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_ARCHITECTURES "60;70;75;80"
 )
+
+# IBM-DEM Collision Validation Test
+add_executable(ibm_dem_collision_test
+    ibm_dem_collision/ibm_dem_collision_test.cu
+    ../src/physics/dem/DEMCore.cu
+    ../src/physics/dem/DEMSolver.cu
+    ../src/physics/ibm/IBMSolver.cu
+    ../src/physics/ibm/IBMCore.cu
+    ../src/physics/ibm/IBMMotion.cpp
+    ../src/geometry/STLGeometryLoader.cpp
+)
+# target_link_libraries(ibm_dem_collision_test PRIVATE physics)
+set_target_properties(ibm_dem_collision_test PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_ARCHITECTURES "60;70;75;80"
+)
