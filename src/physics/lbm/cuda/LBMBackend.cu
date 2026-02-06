@@ -42,6 +42,13 @@ __global__ void kernel_surface_finalize(const float *rho, unsigned char *flags,
                                         float *mass, float *massex, float *phi,
                                         LBMParams params);
 
+// Boundary Kernels
+__global__ void kernel_setup_boundaries(unsigned char* flags, LBMParams params);
+__global__ void kernel_apply_boundaries(__half* fi, float* rho, float* u, 
+                                        const unsigned char* flags, 
+                                        unsigned long long t, 
+                                        LBMParams params);
+
 LBMBackend::~LBMBackend() {
   if (fi_)
     cudaFree(fi_);
@@ -159,6 +166,18 @@ void LBMBackend::kernel_surface_phi_recompute() {
   const dim3 block(256), grid((unsigned int)((params_.N + 255ull) / 256ull));
   lbm::cuda::kernel_surface_finalize<<<grid, block>>>(rho_, flags_, mass_,
                                                       massex_, phi_, params_);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void LBMBackend::kernel_setup_boundaries() {
+  const dim3 block(256), grid((unsigned int)((params_.N + 255ull) / 256ull));
+  lbm::cuda::kernel_setup_boundaries<<<grid, block>>>(flags_, params_);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void LBMBackend::kernel_apply_boundaries(unsigned long long t) {
+  const dim3 block(256), grid((unsigned int)((params_.N + 255ull) / 256ull));
+  lbm::cuda::kernel_apply_boundaries<<<grid, block>>>((__half*)fi_, rho_, u_, flags_, t, params_);
   CUDA_CHECK(cudaGetLastError());
 }
 

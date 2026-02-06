@@ -401,5 +401,120 @@ __global__ void kernel_surface_finalize(const float *rho, unsigned char *flags,
   phi[n] = phin;
 }
 
+// ============================================================================
+// 边界条件初始化内核
+// ============================================================================
+__global__ void kernel_setup_boundaries(unsigned char* flags, LBMParams params) {
+    const unsigned long long n = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= params.N) return;
+
+    unsigned int x, y, z;
+    coordinates(n, params.Nx, params.Ny, &x, &y, &z);
+    
+    // Clear existing boundary flags
+    unsigned char f = flags[n] & ~CellFlag::BOUNDARY_MASK;
+
+    bool is_boundary = false;
+
+    // Check X Min
+    if (x == 0) {
+        if (params.boundaryTypeXMin == 4) { // BC_PRESSURE_OUTLET
+            f |= CellFlag::PRESSURE_OUTLET;
+            is_boundary = true;
+        } else if (params.boundaryTypeXMin == 0) { // BC_BOUNCE_BACK
+             f |= CellFlag::SOLID;
+             is_boundary = true;
+        }
+    }
+    // Check X Max
+    else if (x == params.Nx - 1) {
+        if (params.boundaryTypeXMax == 4) { // BC_PRESSURE_OUTLET
+            f |= CellFlag::PRESSURE_OUTLET;
+            is_boundary = true;
+        } else if (params.boundaryTypeXMax == 0) { // BC_BOUNCE_BACK
+             f |= CellFlag::SOLID;
+             is_boundary = true;
+        }
+    }
+
+    // Similar logic for Y and Z can be added if needed, currently focusing on X for user request
+    if (y == 0 && params.boundaryTypeYMin == 0) { f |= CellFlag::SOLID; is_boundary = true; }
+    if (y == params.Ny - 1 && params.boundaryTypeYMax == 0) { f |= CellFlag::SOLID; is_boundary = true; }
+    if (z == 0 && params.boundaryTypeZMin == 0) { f |= CellFlag::SOLID; is_boundary = true; }
+    // ZMax is usually OPEN (handled by free surface) or SOLID.
+
+    // If it's a boundary, ensure it's not marked as generic fluid/gas unless we want special handling
+    // For PRESSURE_OUTLET, we keep it as FLUID/GAS mainly, but the BOUNDARY_MASK bit is key.
+    // Actually, FORCE it to be FLUID for Pressure Outlet to participate in macro updates?
+    // No, standard LBM pressure outlet is often treated as a special ghost node or just applying distribution functions.
+    // If we mark it PRESSURE_OUTLET (via BOUNDARY_MASK), stream_collide skips it.
+    // So we must handle it in `kernel_apply_boundaries`.
+    
+    flags[n] = f;
+}
+
+// ============================================================================
+// 边界条件应用内核 (Post-Stream or Pre-Collision)
+// ============================================================================
+__global__ void kernel_apply_boundaries(__half* fi, float* rho, float* u, 
+                                        const unsigned char* flags, 
+                                        unsigned long long t, 
+                                        LBMParams params) {
+    const unsigned long long n = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= params.N) return;
+
+    const unsigned char flagsn = flags[n];
+    if (!(flagsn & CellFlag::PRESSURE_OUTLET)) return;
+
+    unsigned int x, y, z;
+    coordinates(n, params.Nx, params.Ny, &x, &y, &z);
+
+    // Target state
+    float rho_tgt = params.pressure_outlet_rho;
+    float ux_tgt = 0.0f, uy_tgt = 0.0f, uz_tgt = 0.0f;
+
+    // Zero gradient velocity: copy from neighbor
+    // X-Min Boundary -> Copy from x+1
+    if (x == 0) {
+        unsigned long long n_nb = index_f((unsigned long long)1 * params.Nx + n, 0, 1); // Incorrect indexing math
+        // Correct neighbor index: (x+1, y, z)
+        // n = z*Nx*Ny + y*Nx + x.  x=0 => n_nb = n + 1
+        unsigned long long nb = n + 1;
+        ux_tgt = u[nb];
+        uy_tgt = u[params.N + nb];
+        uz_tgt = u[2ull * params.N + nb];
+    }
+    // X-Max Boundary -> Copy from x-1
+    else if (x == params.Nx - 1) {
+        unsigned long long nb = n - 1;
+        ux_tgt = u[nb];
+        uy_tgt = u[params.N + nb];
+        uz_tgt = u[2ull * params.N + nb];
+    }
+    
+    // Set Macroscopic (Optional, for visualization)
+    rho[n] = rho_tgt;
+    u[n] = ux_tgt;
+    u[params.N + n] = uy_tgt;
+    u[2ull * params.N + n] = uz_tgt;
+
+    // Set Distribution Functions to Equilibrium
+    float feq[kVelocitySet];
+    calculate_f_eq(rho_tgt, ux_tgt, uy_tgt, uz_tgt, feq);
+
+    unsigned long long j[kVelocitySet];
+    neighbors(n, params.Nx, params.Ny, params.Nz, j);
+    
+    // Store feq into current time step's slot?
+    // standard LBM: stream happens, then we overwrite boundary.
+    // If stream_collide is t, it reads from t-1 and writes to t.
+    // boundaries should write to t. 
+    // BUT stream_collide skips boundaries. So they are unwritten.
+    // So we write feq into `fi` at `t`.
+    
+    // Check `store_f` logic: it writes to `index_f(..., t % 2...)`.
+    store_f(n, feq, fi, j, t, params.N);
+}
+
 } // namespace cuda
 } // namespace lbm

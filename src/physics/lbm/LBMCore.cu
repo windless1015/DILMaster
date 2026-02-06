@@ -50,6 +50,13 @@ void LBMCore::allocateMemory() {
   p.collisionModel = static_cast<cuda::CollisionModel>(
       static_cast<int>(config_.collisionModel));
   p.enableFreeSurface = config_.enableFreeSurface;
+  p.pressure_outlet_rho = config_.pressure_outlet_rho;
+  p.boundaryTypeXMin = (uint8_t)config_.bcXMin;
+  p.boundaryTypeXMax = (uint8_t)config_.bcXMax;
+  p.boundaryTypeYMin = (uint8_t)config_.bcYMin;
+  p.boundaryTypeYMax = (uint8_t)config_.bcYMax;
+  p.boundaryTypeZMin = (uint8_t)config_.bcZMin;
+  p.boundaryTypeZMax = (uint8_t)config_.bcZMax;
 
   // 初始化 CUDA 后端
   backend_.initialize(p);
@@ -98,6 +105,7 @@ void LBMCore::initialize() {
 
   // 初始化分布函数
   backend_.kernel_initialize();
+  backend_.kernel_setup_boundaries(); // 初始化边界标志
   backend_.synchronize();
 
   // 打包速度到 AoS 格式
@@ -135,6 +143,7 @@ void LBMCore::step() {
 
 void LBMCore::streamCollide() {
   backend_.kernel_stream_collide((unsigned long long)stepCount_);
+  backend_.kernel_apply_boundaries((unsigned long long)stepCount_ + 1); // Set for next step
 }
 
 void LBMCore::updateMacroscopic() {

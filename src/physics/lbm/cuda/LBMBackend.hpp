@@ -56,6 +56,10 @@ public:
   void kernel_surface_flag_transition(unsigned long long t);
   void kernel_surface_phi_recompute();
 
+  // Boundary Ops
+  void kernel_setup_boundaries();
+  void kernel_apply_boundaries(unsigned long long t);
+
   // ========================================================================
   // 同步和参数设置
   // ========================================================================

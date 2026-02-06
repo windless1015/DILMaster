@@ -48,7 +48,8 @@ enum BoundaryType : uint8_t {
   BC_BOUNCE_BACK = 0, // 半程反弹 (无滑移固体壁面)
   BC_EQUILIBRIUM = 1, // 平衡态外推
   BC_OPEN = 2,        // 开放边界
-  BC_PERIODIC = 3     // 周期性
+  BC_PERIODIC = 3,    // 周期性
+  BC_PRESSURE_OUTLET = 4 // 压力出口 (Grad U = 0, P = ref)
 };
 
 // ============================================================================
@@ -86,6 +87,7 @@ struct LBMConfig {
   // 初始化参数
   real rho0 = 1.0f;              // 初始密度
   real3 u0 = {0.0f, 0.0f, 0.0f}; // 初始速度
+  real pressure_outlet_rho = 1.0f; // 压力出口参考密度 (P ~ rho)
 };
 
 } // namespace lbm

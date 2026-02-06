@@ -34,6 +34,7 @@ constexpr unsigned int kDimension = 3u;
 // ============================================================================
 namespace CellFlag {
 constexpr uint8_t SOLID = 0x01;     // 固体边界
+constexpr uint8_t PRESSURE_OUTLET = 0x02; // 压力出口
 constexpr uint8_t FLUID = 0x08;     // 流体
 constexpr uint8_t INTERFACE = 0x10; // 界面
 constexpr uint8_t GAS = 0x20;       // 气体
@@ -44,7 +45,7 @@ constexpr uint8_t TO_GAS = 0x30;       // 0x10 | 0x20 - 即将变为气体
 constexpr uint8_t TO_INTERFACE = 0x38; // 0x08 | 0x10 | 0x20 - 即将变为界面
 
 // 掩码
-constexpr uint8_t BOUNDARY_MASK = 0x01; // 边界位
+constexpr uint8_t BOUNDARY_MASK = 0x03; // 边界位 (SOLID | PRESSURE_OUTLET)
 constexpr uint8_t SURFACE_MASK = 0x38;  // 表面状态位
 } // namespace CellFlag
 
@@ -74,6 +75,15 @@ struct LBMParams {
 
   // FreeSurface 开关
   bool enableFreeSurface;
+
+  // Boundary Config
+  float pressure_outlet_rho;
+  uint8_t boundaryTypeXMin;
+  uint8_t boundaryTypeXMax;
+  uint8_t boundaryTypeYMin;
+  uint8_t boundaryTypeYMax;
+  uint8_t boundaryTypeZMin;
+  uint8_t boundaryTypeZMax;
 };
 
 // ============================================================================

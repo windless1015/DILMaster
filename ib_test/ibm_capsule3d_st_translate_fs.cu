@@ -147,14 +147,15 @@ run_simulation(int nx, int ny, int nz, float tau, float U0,
   lbm_cfg.tau = tau;
   lbm_cfg.enableFreeSurface = true;
   lbm_cfg.collisionModel = lbm::CollisionModel::SRT;
-  lbm_cfg.bcXMin = lbm::BC_BOUNCE_BACK;
-  lbm_cfg.bcXMax = lbm::BC_BOUNCE_BACK;
+  lbm_cfg.bcXMin = lbm::BC_PRESSURE_OUTLET;
+  lbm_cfg.bcXMax = lbm::BC_PRESSURE_OUTLET;
   lbm_cfg.bcYMin = lbm::BC_PERIODIC;
   lbm_cfg.bcYMax = lbm::BC_PERIODIC;
   lbm_cfg.bcZMin = lbm::BC_BOUNCE_BACK;
   lbm_cfg.bcZMax = lbm::BC_OPEN;
   lbm_cfg.gravity = make_float3(0, 0, -0.0001f);
   lbm_cfg.rho0 = 1.0f;
+  lbm_cfg.pressure_outlet_rho = 1.0f; // Reference pressure
   lbm_cfg.u0 = make_float3(0.0f, 0.0f, 0.0f);
 
   lbm::LBMCore lbm(lbm_cfg);
