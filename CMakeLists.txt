@@ -33,16 +33,29 @@ find_package(CUDAToolkit REQUIRED)
 # ------------------------------------------------------------------------------
 # Physics Library (LBM Module)
 # ------------------------------------------------------------------------------
-set(LBM_SOURCES
+# ------------------------------------------------------------------------------
+# Physics Library (LBM + IBM + DEM Modules)
+# ------------------------------------------------------------------------------
+set(PHYSICS_SOURCES
   src/physics/lbm/LBMSolver.cu
   src/physics/lbm/LBMCore.cu
   src/physics/lbm/FreeSurfaceModule.cu
   src/physics/lbm/cuda/LBMBackend.cu
   src/physics/lbm/cuda/LBMKernels.cu
   src/physics/lbm/cuda/LBMDeviceConstants.cu
+  # DEM Sources
+  src/physics/dem/DEMCore.cu
+  src/physics/dem/DEMSolver.cu
+  # IBM Sources
+  src/physics/ibm/IBMSolver.cu
+  src/physics/ibm/IBMCore.cu
+  src/physics/ibm/IBMMotion.cpp
+  
+  # Geometry
+  src/geometry/STLGeometryLoader.cpp
 )
 
-add_library(physics ${LBM_SOURCES})
+add_library(physics ${PHYSICS_SOURCES})
 
 target_include_directories(physics PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -50,6 +63,7 @@ target_include_directories(physics PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/src/physics
   ${CMAKE_CURRENT_SOURCE_DIR}/src/physics/lbm
   ${CMAKE_CURRENT_SOURCE_DIR}/src/physics/lbm/cuda
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/physics/dem
 )
 
 target_link_libraries(physics PUBLIC
@@ -77,9 +91,10 @@ target_link_libraries(services PUBLIC
 )
 
 # ------------------------------------------------------------------------------
-# LBM test cases
+# Test Suites
 # ------------------------------------------------------------------------------
 if(BUILD_APPS)
   add_subdirectory(lbm_test)
   add_subdirectory(ib_test)
+  add_subdirectory(dem_test)
 endif()

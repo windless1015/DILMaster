@@ -6,6 +6,7 @@
 #include "../../core/FieldStore.hpp"
 #include "IBMCore.hpp"
 #include "IBMSolver.hpp"
+#include "../../geometry/STLGeometryLoader.hpp"
 #include <cmath>
 #include <cstring>
 
@@ -166,27 +167,67 @@ void IBMSolver::initialize(StepContext &ctx) {
   // 1. 加载/生成几何
   // 1. 加载/生成几何
   if (host_markers_.empty()) {
-      // 尝试从 FieldStore 加载
-      if (ctx.fields && ctx.fields->exists(prefix_ + ".markers")) {
-          auto marker_field = ctx.fields->get(prefix_ + ".markers");
-          // Validate
-    // marker_field.checkType<float3>();
-          
-          size_t num_mc = marker_field.count();
-          
-          host_markers_.resize(num_mc);
-          std::memcpy(host_markers_.data(), marker_field.data(), marker_field.size_bytes());
-          
-          // Also init velocities
-          host_velocities_.resize(num_mc, make_float3(0,0,0));
-          
-          std::cout << "IBMSolver: Loaded " << num_mc << " markers from FieldStore." << std::endl;
-          setNumMarkers(num_mc);
-      } else {
-          // 默认放一个点
+      bool loaded = false;
+      // 1. Try STL
+      if (!config_.stl_file.empty()) {
+          try {
+              // Load STL
+              STLMesh mesh;
+              if (STLReader::readSTL(config_.stl_file, mesh)) {
+                  
+                  // Calc Center for relative pos
+                  float3 center = make_float3(config_.rotation_center_x, config_.rotation_center_y, config_.rotation_center_z);
+                  
+                  // Sample markers
+                  std::vector<IBMMarker> markers = STLGeometryLoader::sampleSurfaceMarkers(
+                      mesh, center, config_.marker_spacing
+                  );
+                  
+                  size_t num = markers.size();
+                  if (num > 0) {
+                      host_markers_.resize(num);
+                      host_velocities_.resize(num, make_float3(0,0,0));
+                      
+                      for(size_t i=0; i<num; ++i) {
+                          host_markers_[i] = markers[i].pos;
+                      }
+                      
+                      std::cout << "IBMSolver: Loaded " << num << " markers from STL: " << config_.stl_file << std::endl;
+                      setNumMarkers(num);
+                      loaded = true;
+                  } else {
+                      std::cerr << "IBMSolver WARNING: STL loaded but 0 markers sampled! Spacing too large?" << std::endl;
+                  }
+              } else {
+                  std::cerr << "IBMSolver ERROR: STLReader returned false for: " << config_.stl_file << std::endl;
+              }
+          } catch (const std::exception& e) {
+              std::cerr << "IBMSolver ERROR: Failed to load STL: " << e.what() << std::endl;
+          }
+      }
+      
+      // 2. FieldStore
+      if (!loaded && ctx.fields && ctx.fields->exists(prefix_ + ".markers")) {
+           auto marker_field = ctx.fields->get(prefix_ + ".markers");
+           size_t num_mc = marker_field.count();
+           
+           host_markers_.resize(num_mc);
+           std::memcpy(host_markers_.data(), marker_field.data(), marker_field.size_bytes());
+           
+           // Also init velocities
+           host_velocities_.resize(num_mc, make_float3(0,0,0));
+           
+           std::cout << "IBMSolver: Loaded " << num_mc << " markers from FieldStore." << std::endl;
+           setNumMarkers(num_mc);
+           loaded = true;
+      }
+      
+      // 3. Default
+      if (!loaded) {
           host_markers_.push_back(make_float3(config_.rotation_center_x, config_.rotation_center_y, config_.rotation_center_z));
           host_velocities_.push_back(make_float3(0,0,0));
           setNumMarkers(1);
+          std::cout << "IBMSolver: Fallback to single marker." << std::endl;
       }
   } else {
       setNumMarkers(host_markers_.size());
@@ -197,7 +238,8 @@ void IBMSolver::initialize(StepContext &ctx) {
       ibm::IBMParams core_params;
       core_params.nMarkers = host_markers_.size();
       core_params.stencil_width = config_.stencil_width;
-      // Set other params if needed
+      core_params.mdf_beta = config_.mdf_beta;
+      core_params.mdf_iterations = config_.mdf_iterations;
       
       core_ = std::make_unique<ibm::IBMCore>(core_params);
   }
@@ -539,6 +581,8 @@ void IBMSolver::setMarkerPositions(const float *positions, std::size_t count) {
       ibm::IBMParams params;
       params.nMarkers = count;
       params.stencil_width = config_.stencil_width;
+      params.mdf_beta = config_.mdf_beta;
+      params.mdf_iterations = config_.mdf_iterations;
       core_ = std::make_unique<ibm::IBMCore>(params);
       core_->initialize();
       

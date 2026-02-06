@@ -1,0 +1,35 @@
+# IBM-DEM Collision Validation Case
+description: "High-speed collision between rotating propeller and particle"
+
+solvers:
+  # IBM: Rotating Propeller
+  - type: IBM
+    stl_file: "tools/propeller_no_stick.stl"
+    marker_spacing: 0.202
+    motion_type: "rotation"
+    rotation:
+      axis: [0, 0, 1]
+      center: [0.5, 0.5, 0.5]
+      angular_velocity: 10.0  # rad/s
+
+  # DEM: Single Particle
+  - type: DEM
+    num_particles: 1
+    particle_radius: 0.01  # 1cm radius
+    particle_density: 2500
+    restitution: 1.0       # Perfectly elastic for validation
+    friction: 0.0
+    gravity: [0, 0, 0]     # No gravity to isolate collision force
+    domain:
+      min: [0, 0, 0]
+      max: [1, 1, 1]
+
+couplings:
+  - type: IBMToDEM
+    stiffness: 1.0e5       # Repulsion stiffness
+    influence_radius: 0.002 # Interaction range beyond surface
+
+validation:
+  metrics:
+    - penetration_depth
+    - energy_conservation

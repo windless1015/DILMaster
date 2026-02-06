@@ -1,0 +1,1128 @@
+/**
+ * @file DEMCore.cu
+ * @brief DEM CUDA kernel implementations and DEMCore methods
+ *
+ * Contains:
+ *   - Spatial hash grid build (compute cell_id, sort, find bounds)
+ *   - Contact detection with tangential friction and contact history
+ *   - Wall contact with same contact model
+ *   - Symplectic Euler integration (translation + rotation)
+ *   - Diagnostic kernels (NaN check, overlap monitoring)
+ */
+
+#include "DEMCore.hpp"
+#include <cstdio>
+#include <cstring>
+#include <cuda_runtime.h>
+#include <stdexcept>
+#include <algorithm>
+#include <iostream>
+
+// Thrust for sorting
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
+#include <thrust/sequence.h>
+
+// ============================================================================
+// CUDA error checking
+// ============================================================================
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                       \
+        cudaError_t err = call;                                                \
+        if (err != cudaSuccess) {                                              \
+            fprintf(stderr, "CUDA Error: %s at %s:%d\n",                       \
+                    cudaGetErrorString(err), __FILE__, __LINE__);               \
+            throw std::runtime_error(std::string("CUDA error: ") +             \
+                                     cudaGetErrorString(err));                 \
+        }                                                                      \
+    } while (0)
+
+namespace dem {
+
+// ============================================================================
+// Device helper: contact hash table operations
+// ============================================================================
+
+static constexpr unsigned long long HASH_GOLDEN = 0x9E3779B97F4A7C15ULL;
+
+__device__ inline int contactHash(unsigned long long key, int mask) {
+    return static_cast<int>((key * HASH_GOLDEN) >> 32) & mask;
+}
+
+/**
+ * @brief Look up tangential displacement for a contact pair in the hash table.
+ * @return Previous xi_t, or (0,0,0) if not found.
+ */
+__device__ inline float3 contactLookup(const ContactEntry *table,
+                                       int mask,
+                                       unsigned long long key) {
+    int slot = contactHash(key, mask);
+    for (int probe = 0; probe < 128; ++probe) {
+        int idx = (slot + probe) & mask;
+        unsigned long long k = table[idx].key;
+        if (k == key) {
+            return make_float3(table[idx].xi_tx,
+                               table[idx].xi_ty,
+                               table[idx].xi_tz);
+        }
+        if (k == CONTACT_EMPTY_KEY) {
+            return make_float3(0.0f, 0.0f, 0.0f);
+        }
+    }
+    return make_float3(0.0f, 0.0f, 0.0f);
+}
+
+/**
+ * @brief Insert/update tangential displacement for a contact pair.
+ * Uses atomicCAS on key for thread-safe insertion with linear probing.
+ */
+__device__ inline bool contactInsert(ContactEntry *table,
+                                     int mask,
+                                     unsigned long long key,
+                                     float3 xi_t) {
+    int slot = contactHash(key, mask);
+    for (int probe = 0; probe < 128; ++probe) {
+        int idx = (slot + probe) & mask;
+        unsigned long long old =
+            atomicCAS(&table[idx].key, CONTACT_EMPTY_KEY, key);
+        if (old == CONTACT_EMPTY_KEY || old == key) {
+            table[idx].xi_tx = xi_t.x;
+            table[idx].xi_ty = xi_t.y;
+            table[idx].xi_tz = xi_t.z;
+            return true;
+        }
+    }
+    return false; // table full — contact history lost for this pair
+}
+
+// ============================================================================
+// CUDA Kernels
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// Clear force and torque arrays
+// ----------------------------------------------------------------------------
+__global__ void kClearForcesTorque(float *force, float *torque, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    force[i]         = 0.0f;
+    force[i + N]     = 0.0f;
+    force[i + 2 * N] = 0.0f;
+    torque[i]         = 0.0f;
+    torque[i + N]     = 0.0f;
+    torque[i + 2 * N] = 0.0f;
+}
+
+// ----------------------------------------------------------------------------
+// Add gravity: F += m * g
+// ----------------------------------------------------------------------------
+__global__ void kAddGravity(float *force,
+                            const float *mass,
+                            float gx, float gy, float gz,
+                            int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float m = mass[i];
+    force[i]         += m * gx;
+    force[i + N]     += m * gy;
+    force[i + 2 * N] += m * gz;
+}
+
+// ----------------------------------------------------------------------------
+// Compute mass properties from radius + density
+// ----------------------------------------------------------------------------
+__global__ void kComputeMassProperties(const float *radius,
+                                       float density,
+                                       float *mass,
+                                       float *inv_mass,
+                                       float *inertia,
+                                       float *inv_inertia,
+                                       int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float r = radius[i];
+    float vol = (4.0f / 3.0f) * 3.14159265358979f * r * r * r;
+    float m = vol * density;
+    if (m < 1e-20f) m = 1e-20f;
+    float I = 0.4f * m * r * r; // (2/5) m r^2
+    if (I < 1e-30f) I = 1e-30f;
+
+    mass[i]         = m;
+    inv_mass[i]     = 1.0f / m;
+    inertia[i]      = I;
+    inv_inertia[i]  = 1.0f / I;
+}
+
+// ----------------------------------------------------------------------------
+// Spatial grid: compute cell id per particle
+// ----------------------------------------------------------------------------
+__global__ void kComputeCellId(const float *pos,
+                               unsigned int *cell_id,
+                               unsigned int *sorted_idx,
+                               float cell_size,
+                               float domain_min_x, float domain_min_y,
+                               float domain_min_z,
+                               int grid_nx, int grid_ny, int grid_nz,
+                               int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float px = pos[i];
+    float py = pos[i + N];
+    float pz = pos[i + 2 * N];
+
+    int cx = static_cast<int>((px - domain_min_x) / cell_size);
+    int cy = static_cast<int>((py - domain_min_y) / cell_size);
+    int cz = static_cast<int>((pz - domain_min_z) / cell_size);
+
+    // Clamp to grid bounds
+    cx = max(0, min(cx, grid_nx - 1));
+    cy = max(0, min(cy, grid_ny - 1));
+    cz = max(0, min(cz, grid_nz - 1));
+
+    cell_id[i]    = static_cast<unsigned int>((cz * grid_ny + cy) * grid_nx + cx);
+    sorted_idx[i] = static_cast<unsigned int>(i);
+}
+
+// ----------------------------------------------------------------------------
+// Spatial grid: find cell_start / cell_end after sorting by cell_id
+// ----------------------------------------------------------------------------
+__global__ void kFindCellBounds(const unsigned int *sorted_cell_id,
+                                unsigned int *cell_start,
+                                unsigned int *cell_end,
+                                int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    unsigned int cell = sorted_cell_id[i];
+
+    if (i == 0 || sorted_cell_id[i - 1] != cell) {
+        cell_start[cell] = static_cast<unsigned int>(i);
+    }
+    if (i == N - 1 || sorted_cell_id[i + 1] != cell) {
+        cell_end[cell] = static_cast<unsigned int>(i + 1);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Clear contact hash table
+// ----------------------------------------------------------------------------
+__global__ void kClearContactTable(ContactEntry *table, int capacity) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= capacity) return;
+    table[i].key = CONTACT_EMPTY_KEY;
+}
+
+// ----------------------------------------------------------------------------
+// Particle-particle contact detection + force computation
+//
+// Uses uniform grid for broad phase.
+// Each thread processes particle i and iterates 27 neighbor cells.
+// Only processes pairs where i < j to avoid double-counting.
+// Contact forces use spring-dashpot + Coulomb friction with history.
+// Forces/torques accumulated via atomicAdd (flagged in docs).
+// ----------------------------------------------------------------------------
+__global__ void kComputeParticleContacts(
+    const float *__restrict__ pos,
+    const float *__restrict__ vel,
+    const float *__restrict__ omega,
+    float *__restrict__ force,
+    float *__restrict__ torque,
+    const float *__restrict__ radius,
+    const float *__restrict__ mass,
+    int N,
+    // grid
+    const unsigned int *__restrict__ cell_start,
+    const unsigned int *__restrict__ cell_end,
+    const unsigned int *__restrict__ sorted_idx,
+    int grid_nx, int grid_ny, int grid_nz,
+    float cell_size,
+    float domain_min_x, float domain_min_y, float domain_min_z,
+    // contacts
+    const ContactEntry *__restrict__ old_contacts,
+    ContactEntry *__restrict__ new_contacts,
+    int contact_mask,
+    // material
+    float kn, float kt, float gamma_n, float gamma_t, float mu,
+    float dt,
+    // diagnostics
+    unsigned int *diag_contact_count,
+    float *diag_max_overlap)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float xi = pos[i];
+    float yi = pos[i + N];
+    float zi = pos[i + 2 * N];
+    float vxi = vel[i];
+    float vyi = vel[i + N];
+    float vzi = vel[i + 2 * N];
+    float wxi = omega[i];
+    float wyi = omega[i + N];
+    float wzi = omega[i + 2 * N];
+    float ri  = radius[i];
+
+    // Cell of particle i
+    int cxi = static_cast<int>((xi - domain_min_x) / cell_size);
+    int cyi = static_cast<int>((yi - domain_min_y) / cell_size);
+    int czi = static_cast<int>((zi - domain_min_z) / cell_size);
+    cxi = max(0, min(cxi, grid_nx - 1));
+    cyi = max(0, min(cyi, grid_ny - 1));
+    czi = max(0, min(czi, grid_nz - 1));
+
+    unsigned int local_contacts = 0;
+
+    // Iterate 27 neighbor cells
+    for (int dz = -1; dz <= 1; ++dz) {
+    for (int dy = -1; dy <= 1; ++dy) {
+    for (int dx = -1; dx <= 1; ++dx) {
+        int ncx = cxi + dx;
+        int ncy = cyi + dy;
+        int ncz = czi + dz;
+        if (ncx < 0 || ncx >= grid_nx ||
+            ncy < 0 || ncy >= grid_ny ||
+            ncz < 0 || ncz >= grid_nz) continue;
+
+        int cell_id = (ncz * grid_ny + ncy) * grid_nx + ncx;
+        unsigned int s_begin = cell_start[cell_id];
+        unsigned int s_end   = cell_end[cell_id];
+
+        for (unsigned int s = s_begin; s < s_end; ++s) {
+            int j = static_cast<int>(sorted_idx[s]);
+            if (j <= i) continue; // only i < j
+
+            float xj = pos[j];
+            float yj = pos[j + N];
+            float zj = pos[j + 2 * N];
+            float rj = radius[j];
+
+            float dx_ij = xi - xj;
+            float dy_ij = yi - yj;
+            float dz_ij = zi - zj;
+            float dist_sq = dx_ij * dx_ij + dy_ij * dy_ij + dz_ij * dz_ij;
+            float rad_sum = ri + rj;
+
+            if (dist_sq >= rad_sum * rad_sum) continue;
+
+            float dist = sqrtf(dist_sq);
+            if (dist < 1e-10f) continue;
+
+            float overlap = rad_sum - dist;
+
+            // Track max overlap
+            atomicMax(reinterpret_cast<int *>(diag_max_overlap),
+                      __float_as_int(overlap));
+
+            // Normal direction (j -> i)
+            float inv_d = 1.0f / dist;
+            float nx = dx_ij * inv_d;
+            float ny = dy_ij * inv_d;
+            float nz = dz_ij * inv_d;
+
+            // Relative velocity at contact point
+            // v_rel = (vi - vj) - (ri*omega_i + rj*omega_j) x n
+            float dvx = vxi - vel[j];
+            float dvy = vyi - vel[j + N];
+            float dvz = vzi - vel[j + 2 * N];
+
+            float wxj = omega[j];
+            float wyj = omega[j + N];
+            float wzj = omega[j + 2 * N];
+
+            // (ri*wi + rj*wj)
+            float rwx = ri * wxi + rj * wxj;
+            float rwy = ri * wyi + rj * wyj;
+            float rwz = ri * wzi + rj * wzj;
+
+            // cross(rw, n)
+            float crx = rwy * nz - rwz * ny;
+            float cry = rwz * nx - rwx * nz;
+            float crz = rwx * ny - rwy * nx;
+
+            dvx -= crx;
+            dvy -= cry;
+            dvz -= crz;
+
+            // Normal velocity component
+            float vn = dvx * nx + dvy * ny + dvz * nz;
+
+            // Tangential velocity
+            float vtx = dvx - vn * nx;
+            float vty = dvy - vn * ny;
+            float vtz = dvz - vn * nz;
+
+            // --- Normal force ---
+            float fn = kn * overlap - gamma_n * vn;
+            if (fn < 0.0f) fn = 0.0f; // no adhesion
+
+            // --- Contact history ---
+            unsigned long long ckey = makeContactKey(
+                static_cast<unsigned int>(i), static_cast<unsigned int>(j));
+            float3 xi_t = contactLookup(old_contacts, contact_mask, ckey);
+
+            // Update tangential displacement
+            xi_t.x += vtx * dt;
+            xi_t.y += vty * dt;
+            xi_t.z += vtz * dt;
+
+            // Project onto tangential plane
+            float xi_dot_n = xi_t.x * nx + xi_t.y * ny + xi_t.z * nz;
+            xi_t.x -= xi_dot_n * nx;
+            xi_t.y -= xi_dot_n * ny;
+            xi_t.z -= xi_dot_n * nz;
+
+            // Trial tangential force
+            float ftx = -kt * xi_t.x - gamma_t * vtx;
+            float fty = -kt * xi_t.y - gamma_t * vty;
+            float ftz = -kt * xi_t.z - gamma_t * vtz;
+
+            float ft_mag = sqrtf(ftx * ftx + fty * fty + ftz * ftz);
+            float ft_max = mu * fn;
+
+            if (ft_mag > ft_max && ft_mag > 1e-10f) {
+                // Coulomb truncation
+                float scale = ft_max / ft_mag;
+                ftx *= scale;
+                fty *= scale;
+                ftz *= scale;
+
+                // Correct tangential displacement for truncation
+                if (kt > 1e-10f) {
+                    xi_t.x = -(ftx + gamma_t * vtx) / kt;
+                    xi_t.y = -(fty + gamma_t * vty) / kt;
+                    xi_t.z = -(ftz + gamma_t * vtz) / kt;
+                }
+            }
+
+            // Store contact history
+            contactInsert(new_contacts, contact_mask, ckey, xi_t);
+
+            // Total contact force on i
+            float fix = fn * nx + ftx;
+            float fiy = fn * ny + fty;
+            float fiz = fn * nz + ftz;
+
+            // Accumulate force (atomicAdd — see performance note in header)
+            atomicAdd(&force[i],         fix);
+            atomicAdd(&force[i + N],     fiy);
+            atomicAdd(&force[i + 2 * N], fiz);
+            atomicAdd(&force[j],         -fix);
+            atomicAdd(&force[j + N],     -fiy);
+            atomicAdd(&force[j + 2 * N], -fiz);
+
+            // Torque: T = -R * (n x F)
+            // n x F = (ny*fiz - nz*fiy, nz*fix - nx*fiz, nx*fiy - ny*fix)
+            float nxF_x = ny * fiz - nz * fiy;
+            float nxF_y = nz * fix - nx * fiz;
+            float nxF_z = nx * fiy - ny * fix;
+
+            // Torque on i: -ri * (n x F)
+            atomicAdd(&torque[i],         -ri * nxF_x);
+            atomicAdd(&torque[i + N],     -ri * nxF_y);
+            atomicAdd(&torque[i + 2 * N], -ri * nxF_z);
+
+            // Torque on j: -rj * (n x F)
+            atomicAdd(&torque[j],         -rj * nxF_x);
+            atomicAdd(&torque[j + N],     -rj * nxF_y);
+            atomicAdd(&torque[j + 2 * N], -rj * nxF_z);
+
+            ++local_contacts;
+        }
+    }}}
+
+    if (local_contacts > 0) {
+        atomicAdd(diag_contact_count, local_contacts);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Particle-wall contact
+//
+// 6 axis-aligned walls. Uses same contact model as particle-particle.
+// Wall = infinite mass => only particle receives force/torque.
+// Contact history stored with j = N + wall_face_id.
+// ----------------------------------------------------------------------------
+__global__ void kComputeWallContacts(
+    const float *__restrict__ pos,
+    const float *__restrict__ vel,
+    const float *__restrict__ omega,
+    float *__restrict__ force,
+    float *__restrict__ torque,
+    const float *__restrict__ radius,
+    int N,
+    float domain_min_x, float domain_min_y, float domain_min_z,
+    float domain_max_x, float domain_max_y, float domain_max_z,
+    const ContactEntry *__restrict__ old_contacts,
+    ContactEntry *__restrict__ new_contacts,
+    int contact_mask,
+    float kn, float kt, float gamma_n, float gamma_t, float mu,
+    float dt,
+    unsigned int *diag_wall_count,
+    float *diag_max_overlap)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float px = pos[i];
+    float py = pos[i + N];
+    float pz = pos[i + 2 * N];
+    float vx = vel[i];
+    float vy = vel[i + N];
+    float vz = vel[i + 2 * N];
+    float wx = omega[i];
+    float wy = omega[i + N];
+    float wz = omega[i + 2 * N];
+    float r  = radius[i];
+
+    // Wall definitions: distance from particle center to wall surface (positive = inside)
+    // wall 0: x_min, normal (+1,0,0)   dist = px - domain_min_x
+    // wall 1: x_max, normal (-1,0,0)   dist = domain_max_x - px
+    // wall 2: y_min, normal (0,+1,0)   dist = py - domain_min_y
+    // wall 3: y_max, normal (0,-1,0)   dist = domain_max_y - py
+    // wall 4: z_min, normal (0,0,+1)   dist = pz - domain_min_z
+    // wall 5: z_max, normal (0,0,-1)   dist = domain_max_z - pz
+
+    float w_dist[6];
+    w_dist[0] = px - domain_min_x;
+    w_dist[1] = domain_max_x - px;
+    w_dist[2] = py - domain_min_y;
+    w_dist[3] = domain_max_y - py;
+    w_dist[4] = pz - domain_min_z;
+    w_dist[5] = domain_max_z - pz;
+
+    // Wall normals (pointing inward, into domain)
+    float wnx[6] = { 1, -1,  0,  0,  0,  0};
+    float wny[6] = { 0,  0,  1, -1,  0,  0};
+    float wnz[6] = { 0,  0,  0,  0,  1, -1};
+
+    unsigned int local_wall = 0;
+
+    for (int w = 0; w < 6; ++w) {
+        float overlap = r - w_dist[w];
+        if (overlap <= 0.0f) continue;
+
+        atomicMax(reinterpret_cast<int *>(diag_max_overlap),
+                  __float_as_int(overlap));
+
+        float nx = wnx[w];
+        float ny = wny[w];
+        float nz = wnz[w];
+
+        // Relative velocity (wall velocity = 0)
+        // v_rel = v_particle + omega x r_contact
+        // r_contact = -r * n (from center to contact point, toward wall)
+        // omega x (-r*n) = -r * (omega x n)
+        float crx = wy * nz - wz * ny;
+        float cry = wz * nx - wx * nz;
+        float crz = wx * ny - wy * nx;
+
+        float dvx = vx - r * crx;
+        float dvy = vy - r * cry;
+        float dvz = vz - r * crz;
+
+        // Normal velocity
+        float vn = dvx * nx + dvy * ny + dvz * nz;
+
+        // Tangential velocity
+        float vtx = dvx - vn * nx;
+        float vty = dvy - vn * ny;
+        float vtz = dvz - vn * nz;
+
+        // Normal force (wall has infinite mass => m_eff = m_particle)
+        float fn = kn * overlap - gamma_n * vn;
+        if (fn < 0.0f) fn = 0.0f;
+
+        // Contact history
+        unsigned long long ckey = makeContactKey(
+            static_cast<unsigned int>(i),
+            static_cast<unsigned int>(N + w));
+        float3 xi_t = contactLookup(old_contacts, contact_mask, ckey);
+
+        xi_t.x += vtx * dt;
+        xi_t.y += vty * dt;
+        xi_t.z += vtz * dt;
+
+        // Project to tangent plane
+        float xi_dot_n = xi_t.x * nx + xi_t.y * ny + xi_t.z * nz;
+        xi_t.x -= xi_dot_n * nx;
+        xi_t.y -= xi_dot_n * ny;
+        xi_t.z -= xi_dot_n * nz;
+
+        // Tangential force
+        float ftx = -kt * xi_t.x - gamma_t * vtx;
+        float fty = -kt * xi_t.y - gamma_t * vty;
+        float ftz = -kt * xi_t.z - gamma_t * vtz;
+
+        float ft_mag = sqrtf(ftx * ftx + fty * fty + ftz * ftz);
+        float ft_max = mu * fn;
+
+        if (ft_mag > ft_max && ft_mag > 1e-10f) {
+            float scale = ft_max / ft_mag;
+            ftx *= scale;
+            fty *= scale;
+            ftz *= scale;
+            if (kt > 1e-10f) {
+                xi_t.x = -(ftx + gamma_t * vtx) / kt;
+                xi_t.y = -(fty + gamma_t * vty) / kt;
+                xi_t.z = -(ftz + gamma_t * vtz) / kt;
+            }
+        }
+
+        contactInsert(new_contacts, contact_mask, ckey, xi_t);
+
+        // Apply force to particle (wall doesn't move)
+        float fix = fn * nx + ftx;
+        float fiy = fn * ny + fty;
+        float fiz = fn * nz + ftz;
+
+        force[i]         += fix;
+        force[i + N]     += fiy;
+        force[i + 2 * N] += fiz;
+
+        // Torque: T = r_contact x F = (-r*n) x F = -r * (n x F)
+        float nxF_x = ny * fiz - nz * fiy;
+        float nxF_y = nz * fix - nx * fiz;
+        float nxF_z = nx * fiy - ny * fix;
+
+        torque[i]         += -r * nxF_x;
+        torque[i + N]     += -r * nxF_y;
+        torque[i + 2 * N] += -r * nxF_z;
+
+        ++local_wall;
+    }
+
+    if (local_wall > 0) {
+        atomicAdd(diag_wall_count, local_wall);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Symplectic Euler integration
+//
+// v(t+dt)     = v(t)     + (F/m) * dt
+// omega(t+dt) = omega(t) + (T/I) * dt
+// x(t+dt)     = x(t)     + v(t+dt) * dt
+//
+// Note: position updated with NEW velocity (symplectic / semi-implicit).
+// This is energy-stable and standard for DEM.
+// ----------------------------------------------------------------------------
+__global__ void kIntegrateSymplecticEuler(
+    float *pos,
+    float *vel,
+    float *omega,
+    const float *force,
+    const float *torque,
+    const float *inv_mass,
+    const float *inv_inertia,
+    float dt,
+    int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float im  = inv_mass[i];
+    float iI  = inv_inertia[i];
+
+    // Update velocity
+    float vx = vel[i]         + force[i]         * im * dt;
+    float vy = vel[i + N]     + force[i + N]     * im * dt;
+    float vz = vel[i + 2 * N] + force[i + 2 * N] * im * dt;
+
+    vel[i]         = vx;
+    vel[i + N]     = vy;
+    vel[i + 2 * N] = vz;
+
+    // Update angular velocity
+    omega[i]         += torque[i]         * iI * dt;
+    omega[i + N]     += torque[i + N]     * iI * dt;
+    omega[i + 2 * N] += torque[i + 2 * N] * iI * dt;
+
+    // Update position with new velocity
+    pos[i]         += vx * dt;
+    pos[i + N]     += vy * dt;
+    pos[i + 2 * N] += vz * dt;
+}
+
+// ----------------------------------------------------------------------------
+// Naive N^2 collision (debug path, no contact history)
+// ----------------------------------------------------------------------------
+__global__ void kComputeCollisionsNaive(
+    const float *pos, const float *vel, const float *omega,
+    float *force, float *torque,
+    const float *radius,
+    float kn, float gamma_n, float mu, float kt, float gamma_t,
+    float dt,
+    int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float xi = pos[i], yi = pos[i + N], zi = pos[i + 2 * N];
+    float vxi = vel[i], vyi = vel[i + N], vzi = vel[i + 2 * N];
+    float ri = radius[i];
+
+    float fix = 0, fiy = 0, fiz = 0;
+
+    for (int j = 0; j < N; ++j) {
+        if (i == j) continue;
+        float dx = xi - pos[j];
+        float dy = yi - pos[j + N];
+        float dz = zi - pos[j + 2 * N];
+        float dist_sq = dx * dx + dy * dy + dz * dz;
+        float rsum = ri + radius[j];
+        if (dist_sq >= rsum * rsum) continue;
+        float dist = sqrtf(dist_sq);
+        if (dist < 1e-10f) continue;
+        float overlap = rsum - dist;
+        float inv_d = 1.0f / dist;
+        float nx = dx * inv_d, ny = dy * inv_d, nz = dz * inv_d;
+        float dvx = vxi - vel[j], dvy = vyi - vel[j + N], dvz = vzi - vel[j + 2 * N];
+        float vn = dvx * nx + dvy * ny + dvz * nz;
+        float fn = kn * overlap - gamma_n * vn;
+        if (fn < 0) fn = 0;
+        // Tangential (no history in naive mode)
+        float vtx = dvx - vn * nx, vty = dvy - vn * ny, vtz = dvz - vn * nz;
+        float ftx = -gamma_t * vtx, fty = -gamma_t * vty, ftz = -gamma_t * vtz;
+        float ft_m = sqrtf(ftx*ftx + fty*fty + ftz*ftz);
+        float ft_max = mu * fn;
+        if (ft_m > ft_max && ft_m > 1e-10f) {
+            float s = ft_max / ft_m;
+            ftx *= s; fty *= s; ftz *= s;
+        }
+        fix += fn * nx + ftx;
+        fiy += fn * ny + fty;
+        fiz += fn * nz + ftz;
+    }
+    force[i]         += fix;
+    force[i + N]     += fiy;
+    force[i + 2 * N] += fiz;
+}
+
+// ----------------------------------------------------------------------------
+// Health check: detect NaN in position/velocity
+// ----------------------------------------------------------------------------
+__global__ void kCheckNaN(const float *pos, const float *vel,
+                          unsigned int *nan_flag, int N) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    auto bad = [](float v) { return isnan(v) || isinf(v); };
+    if (bad(pos[i]) || bad(pos[i+N]) || bad(pos[i+2*N]) ||
+        bad(vel[i]) || bad(vel[i+N]) || bad(vel[i+2*N])) {
+        atomicExch(nan_flag, 1u);
+    }
+}
+
+// ============================================================================
+// DEMCore Implementation
+// ============================================================================
+
+DEMCore::DEMCore() = default;
+
+DEMCore::~DEMCore() {
+    freeMemory();
+}
+
+void DEMCore::configure(const DEMConfig &cfg) {
+    cfg_ = cfg;
+    std::size_t N = cfg_.num_particles;
+
+    // Cell size
+    cell_size_ = cfg_.cell_size;
+    if (cell_size_ <= 0.0f) {
+        cell_size_ = 2.0f * cfg_.particle_radius;
+    }
+
+    // Grid dimensions
+    float lx = cfg_.domain_max_x - cfg_.domain_min_x;
+    float ly = cfg_.domain_max_y - cfg_.domain_min_y;
+    float lz = cfg_.domain_max_z - cfg_.domain_min_z;
+    grid_nx_ = std::max(1, static_cast<int>(std::ceil(lx / cell_size_)));
+    grid_ny_ = std::max(1, static_cast<int>(std::ceil(ly / cell_size_)));
+    grid_nz_ = std::max(1, static_cast<int>(std::ceil(lz / cell_size_)));
+    num_cells_ = grid_nx_ * grid_ny_ * grid_nz_;
+
+    // Contact hash table capacity (power of 2, ~8x particles for headroom)
+    int cap = 1;
+    int target = static_cast<int>(N) * 8;
+    if (target < 64) target = 64;
+    while (cap < target) cap <<= 1;
+    contact_capacity_ = cap;
+    contact_mask_     = cap - 1;
+
+    // Auto-compute damping from restitution if needed
+    float m_default = sphereMass(cfg_.particle_radius, cfg_.particle_density);
+    float m_eff_pp  = m_default * 0.5f;  // effective mass for two equal particles
+    float m_eff_pw  = m_default;          // effective mass for particle-wall
+
+    gamma_n_ = cfg_.material.gamma_n;
+    if (gamma_n_ <= 0.0f) {
+        // Use average of pp and pw effective masses
+        float m_eff_avg = (m_eff_pp + m_eff_pw) * 0.5f;
+        gamma_n_ = computeDampingFromRestitution(
+            cfg_.material.restitution, cfg_.material.kn, m_eff_avg);
+    }
+
+    gamma_t_ = cfg_.material.gamma_t;
+    if (gamma_t_ <= 0.0f) {
+        gamma_t_ = gamma_n_;  // default: same as normal damping
+    }
+}
+
+void DEMCore::allocate() {
+    if (allocated_) freeMemory();
+
+    std::size_t N = cfg_.num_particles;
+    if (N == 0) return;
+
+    // Particle buffers
+    CUDA_CHECK(cudaMalloc(&d_pos_,         3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_vel_,         3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_omega_,       3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_force_,       3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_torque_,      3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_radius_,      N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_mass_,        N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inv_mass_,    N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inertia_,     N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inv_inertia_, N * sizeof(float)));
+
+    // Zero-initialize
+    CUDA_CHECK(cudaMemset(d_pos_,     0, 3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_vel_,     0, 3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_omega_,   0, 3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_force_,   0, 3 * N * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_torque_,  0, 3 * N * sizeof(float)));
+
+    // Grid buffers
+    CUDA_CHECK(cudaMalloc(&d_cell_id_,    N * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_sorted_idx_, N * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_cell_start_, num_cells_ * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_cell_end_,   num_cells_ * sizeof(unsigned int)));
+
+    // Contact history tables
+    CUDA_CHECK(cudaMalloc(&d_contacts_old_,
+                          contact_capacity_ * sizeof(ContactEntry)));
+    CUDA_CHECK(cudaMalloc(&d_contacts_new_,
+                          contact_capacity_ * sizeof(ContactEntry)));
+
+    // Clear contact tables
+    int ct_blocks = (contact_capacity_ + 255) / 256;
+    kClearContactTable<<<ct_blocks, 256>>>(d_contacts_old_, contact_capacity_);
+    kClearContactTable<<<ct_blocks, 256>>>(d_contacts_new_, contact_capacity_);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Diagnostic counters
+    CUDA_CHECK(cudaMalloc(&d_diag_, 3 * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMalloc(&d_diag_max_overlap_, sizeof(float)));
+
+    allocated_ = true;
+}
+
+void DEMCore::freeMemory() {
+    auto safe_free = [](void *&p) {
+        if (p) { cudaFree(p); p = nullptr; }
+    };
+    safe_free(reinterpret_cast<void*&>(d_pos_));
+    safe_free(reinterpret_cast<void*&>(d_vel_));
+    safe_free(reinterpret_cast<void*&>(d_omega_));
+    safe_free(reinterpret_cast<void*&>(d_force_));
+    safe_free(reinterpret_cast<void*&>(d_torque_));
+    safe_free(reinterpret_cast<void*&>(d_radius_));
+    safe_free(reinterpret_cast<void*&>(d_mass_));
+    safe_free(reinterpret_cast<void*&>(d_inv_mass_));
+    safe_free(reinterpret_cast<void*&>(d_inertia_));
+    safe_free(reinterpret_cast<void*&>(d_inv_inertia_));
+    safe_free(reinterpret_cast<void*&>(d_cell_id_));
+    safe_free(reinterpret_cast<void*&>(d_sorted_idx_));
+    safe_free(reinterpret_cast<void*&>(d_cell_start_));
+    safe_free(reinterpret_cast<void*&>(d_cell_end_));
+    safe_free(reinterpret_cast<void*&>(d_contacts_old_));
+    safe_free(reinterpret_cast<void*&>(d_contacts_new_));
+    safe_free(reinterpret_cast<void*&>(d_diag_));
+    safe_free(reinterpret_cast<void*&>(d_diag_max_overlap_));
+    allocated_ = false;
+}
+
+// ========================================================================
+// Host <-> Device transfers
+// ========================================================================
+
+void DEMCore::uploadPositions(const float *h) {
+    CUDA_CHECK(cudaMemcpy(d_pos_, h, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyHostToDevice));
+}
+void DEMCore::uploadVelocities(const float *h) {
+    CUDA_CHECK(cudaMemcpy(d_vel_, h, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyHostToDevice));
+}
+void DEMCore::uploadAngularVelocities(const float *h) {
+    CUDA_CHECK(cudaMemcpy(d_omega_, h, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyHostToDevice));
+}
+void DEMCore::uploadRadii(const float *h) {
+    CUDA_CHECK(cudaMemcpy(d_radius_, h, cfg_.num_particles * sizeof(float),
+                          cudaMemcpyHostToDevice));
+}
+
+void DEMCore::downloadPositions(float *h) const {
+    CUDA_CHECK(cudaMemcpy(h, d_pos_, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+}
+void DEMCore::downloadVelocities(float *h) const {
+    CUDA_CHECK(cudaMemcpy(h, d_vel_, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+}
+void DEMCore::downloadAngularVelocities(float *h) const {
+    CUDA_CHECK(cudaMemcpy(h, d_omega_, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+}
+void DEMCore::downloadForces(float *h) const {
+    CUDA_CHECK(cudaMemcpy(h, d_force_, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+}
+void DEMCore::downloadTorques(float *h) const {
+    CUDA_CHECK(cudaMemcpy(h, d_torque_, 3 * cfg_.num_particles * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+}
+void DEMCore::downloadRadii(float *h) const {
+    CUDA_CHECK(cudaMemcpy(h, d_radius_, cfg_.num_particles * sizeof(float),
+                          cudaMemcpyDeviceToHost));
+}
+
+void DEMCore::initMassProperties() {
+    int N = static_cast<int>(cfg_.num_particles);
+    int threads = 256;
+    int blocks = (N + threads - 1) / threads;
+    kComputeMassProperties<<<blocks, threads>>>(
+        d_radius_, cfg_.particle_density,
+        d_mass_, d_inv_mass_, d_inertia_, d_inv_inertia_, N);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ========================================================================
+// Simulation step
+// ========================================================================
+
+void DEMCore::step(float dt) {
+    if (!allocated_ || cfg_.num_particles == 0) return;
+
+    // 1. Clear force/torque
+    clearForcesTorque();
+
+    // 2. Add gravity
+    addGravity();
+
+    // 3. Build spatial grid (broad phase)
+    if (!cfg_.use_naive_n2) {
+        buildSpatialGrid();
+    }
+
+    // 4. Swap contact tables (old <- new; clear new)
+    swapContactTables();
+
+    // 5. Particle-particle contacts
+    if (cfg_.num_particles > 1) {
+        computeParticleContacts(dt);
+    }
+
+    // 6. Wall contacts
+    computeWallContacts(dt);
+
+    // 7. Integrate
+    integrateSymplecticEuler(dt);
+
+    // 8. Diagnostics
+    gatherDiagnostics();
+
+    ++step_count_;
+}
+
+void DEMCore::stepMultiple(float dt, int substeps) {
+    if (substeps <= 0) substeps = 1;
+    float dt_sub = dt / static_cast<float>(substeps);
+    for (int s = 0; s < substeps; ++s) {
+        step(dt_sub);
+    }
+}
+
+// ========================================================================
+// Internal pipeline stages
+// ========================================================================
+
+void DEMCore::clearForcesTorque() {
+    int N = static_cast<int>(cfg_.num_particles);
+    int blocks = (N + 255) / 256;
+    kClearForcesTorque<<<blocks, 256>>>(d_force_, d_torque_, N);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void DEMCore::clearForcesTorquePublic() {
+    clearForcesTorque();
+}
+
+void DEMCore::addGravity() {
+    int N = static_cast<int>(cfg_.num_particles);
+    int blocks = (N + 255) / 256;
+    kAddGravity<<<blocks, 256>>>(d_force_, d_mass_,
+                                  cfg_.gravity_x, cfg_.gravity_y, cfg_.gravity_z,
+                                  N);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void DEMCore::buildSpatialGrid() {
+    int N = static_cast<int>(cfg_.num_particles);
+    if (N == 0) return;
+
+    int threads = 256;
+    int blocks  = (N + threads - 1) / threads;
+
+    // 1. Compute cell_id and initialize sorted_idx = identity
+    kComputeCellId<<<blocks, threads>>>(
+        d_pos_, d_cell_id_, d_sorted_idx_,
+        cell_size_,
+        cfg_.domain_min_x, cfg_.domain_min_y, cfg_.domain_min_z,
+        grid_nx_, grid_ny_, grid_nz_, N);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 2. Sort by cell_id (thrust)
+    thrust::device_ptr<unsigned int> keys(d_cell_id_);
+    thrust::device_ptr<unsigned int> vals(d_sorted_idx_);
+    thrust::sort_by_key(keys, keys + N, vals);
+
+    // 3. Initialize cell_start/end
+    CUDA_CHECK(cudaMemset(d_cell_start_, 0xFF,
+                          num_cells_ * sizeof(unsigned int)));
+    CUDA_CHECK(cudaMemset(d_cell_end_, 0,
+                          num_cells_ * sizeof(unsigned int)));
+
+    // 4. Find cell boundaries
+    kFindCellBounds<<<blocks, threads>>>(
+        d_cell_id_, d_cell_start_, d_cell_end_, N);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void DEMCore::swapContactTables() {
+    // Swap old <-> new
+    std::swap(d_contacts_old_, d_contacts_new_);
+
+    // Clear new table
+    int blocks = (contact_capacity_ + 255) / 256;
+    kClearContactTable<<<blocks, 256>>>(d_contacts_new_, contact_capacity_);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Clear diagnostic counters
+    CUDA_CHECK(cudaMemset(d_diag_, 0, 3 * sizeof(unsigned int)));
+    float zero = 0.0f;
+    CUDA_CHECK(cudaMemcpy(d_diag_max_overlap_, &zero, sizeof(float),
+                          cudaMemcpyHostToDevice));
+}
+
+void DEMCore::computeParticleContacts(float dt) {
+    int N = static_cast<int>(cfg_.num_particles);
+
+    if (cfg_.use_naive_n2) {
+        // Debug path: N^2 without contact history
+        int blocks = (N + 127) / 128;
+        kComputeCollisionsNaive<<<blocks, 128>>>(
+            d_pos_, d_vel_, d_omega_, d_force_, d_torque_, d_radius_,
+            cfg_.material.kn, gamma_n_, cfg_.material.mu,
+            cfg_.material.kt, gamma_t_, dt, N);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    int blocks = (N + 127) / 128;
+    kComputeParticleContacts<<<blocks, 128>>>(
+        d_pos_, d_vel_, d_omega_, d_force_, d_torque_,
+        d_radius_, d_mass_, N,
+        d_cell_start_, d_cell_end_, d_sorted_idx_,
+        grid_nx_, grid_ny_, grid_nz_,
+        cell_size_,
+        cfg_.domain_min_x, cfg_.domain_min_y, cfg_.domain_min_z,
+        d_contacts_old_, d_contacts_new_, contact_mask_,
+        cfg_.material.kn, cfg_.material.kt,
+        gamma_n_, gamma_t_, cfg_.material.mu,
+        dt,
+        &d_diag_[0], d_diag_max_overlap_);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void DEMCore::computeWallContacts(float dt) {
+    int N = static_cast<int>(cfg_.num_particles);
+    int blocks = (N + 255) / 256;
+    kComputeWallContacts<<<blocks, 256>>>(
+        d_pos_, d_vel_, d_omega_, d_force_, d_torque_, d_radius_, N,
+        cfg_.domain_min_x, cfg_.domain_min_y, cfg_.domain_min_z,
+        cfg_.domain_max_x, cfg_.domain_max_y, cfg_.domain_max_z,
+        d_contacts_old_, d_contacts_new_, contact_mask_,
+        cfg_.material.kn, cfg_.material.kt,
+        gamma_n_, gamma_t_, cfg_.material.mu,
+        dt,
+        &d_diag_[1], d_diag_max_overlap_);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void DEMCore::integrateSymplecticEuler(float dt) {
+    int N = static_cast<int>(cfg_.num_particles);
+    int blocks = (N + 255) / 256;
+    kIntegrateSymplecticEuler<<<blocks, 256>>>(
+        d_pos_, d_vel_, d_omega_,
+        d_force_, d_torque_,
+        d_inv_mass_, d_inv_inertia_,
+        dt, N);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void DEMCore::gatherDiagnostics() {
+    unsigned int h_diag[3] = {0, 0, 0};
+    float h_max_overlap = 0.0f;
+
+    CUDA_CHECK(cudaMemcpy(h_diag, d_diag_, 3 * sizeof(unsigned int),
+                          cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&h_max_overlap, d_diag_max_overlap_, sizeof(float),
+                          cudaMemcpyDeviceToHost));
+
+    last_stats_.particle_contacts = h_diag[0];
+    last_stats_.wall_contacts     = h_diag[1];
+    last_stats_.has_nan           = (h_diag[2] != 0);
+    last_stats_.max_overlap       = h_max_overlap;
+
+    // Warnings
+    float warn_threshold = cfg_.max_overlap_warn * cfg_.particle_radius;
+    if (h_max_overlap > warn_threshold) {
+        fprintf(stderr,
+                "[DEM WARNING] Step %llu: max overlap %.4e > %.1f%% of R (%.4e)\n",
+                step_count_, h_max_overlap,
+                cfg_.max_overlap_warn * 100.0f, warn_threshold);
+    }
+}
+
+bool DEMCore::checkHealth() const {
+    int N = static_cast<int>(cfg_.num_particles);
+    if (N == 0) return true;
+
+    // Run NaN check kernel
+    CUDA_CHECK(cudaMemset(const_cast<unsigned int*>(&d_diag_[2]), 0,
+                          sizeof(unsigned int)));
+    int blocks = (N + 255) / 256;
+    kCheckNaN<<<blocks, 256>>>(d_pos_, d_vel_,
+                                const_cast<unsigned int*>(&d_diag_[2]), N);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    unsigned int nan_flag = 0;
+    CUDA_CHECK(cudaMemcpy(&nan_flag, &d_diag_[2], sizeof(unsigned int),
+                          cudaMemcpyDeviceToHost));
+    if (nan_flag) {
+        fprintf(stderr, "[DEM ERROR] NaN detected in position/velocity!\n");
+        return false;
+    }
+    return true;
+}
+
+void DEMCore::synchronize() const {
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+} // namespace dem
