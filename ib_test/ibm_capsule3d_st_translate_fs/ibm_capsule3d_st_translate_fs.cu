@@ -411,6 +411,19 @@ std::vector<float> parseList(std::string str) {
 }
 
 struct AppConfig {
+  struct PhysicalConfig {
+    bool enabled;
+    float domain_lx_m;
+    float domain_ly_m;
+    float domain_lz_m;
+    float u0_mps;
+    float dt_s;
+    float capsule_diameter_m;
+    float single_depth_m;
+    std::vector<float> depth_list_m;
+    std::vector<float> velocity_list_mps;
+  };
+
   std::string stl_path;
   int nx;
   int ny;
@@ -428,8 +441,10 @@ struct AppConfig {
   float fluid_fraction;
   float capsule_x_ratio;
   float capsule_depth_ratio;
+  float single_depth_R;
   std::vector<float> depth_list;
   std::vector<float> velocity_list;
+  PhysicalConfig physical;
 };
 
 #ifndef IBM_CAPSULE3D_ST_TRANSLATE_FS_CONFIG
@@ -438,15 +453,34 @@ struct AppConfig {
 
 AppConfig loadConfig(const std::string &config_path) {
   AppConfig cfg{
-      "../../tools/capsule.stl", 512, 128, 128, 0.8f, 0.08f, 1.0f, 5,    -0.5f,
-      0.0f,                    1.0f, 5000, 100, "out/capsule_fs", 0.7f, 0.15f,
-      0.5f,                    {1.5f, 2.0f, 3.0f, 4.0f, 5.0f}, {0.04f, 0.06f, 0.08f}};
+      "../../tools/capsule.stl",
+      512,
+      128,
+      128,
+      0.8f,
+      0.08f,
+      1.0f,
+      5,
+      -0.5f,
+      0.0f,
+      1.0f,
+      5000,
+      100,
+      "out/capsule_fs",
+      0.7f,
+      0.15f,
+      0.5f,
+      -1.0f,
+      {1.5f, 2.0f, 3.0f, 4.0f, 5.0f},
+      {0.04f, 0.06f, 0.08f},
+      {false, 100.0f, 25.0f, 25.0f, 10.0f, 0.0f, 6.0f, -1.0f, {}, {}}};
 
   toml::table tbl = toml::parse_file(config_path);
   auto sim = tbl["simulation"].as_table();
   auto geom = tbl["geometry"].as_table();
   auto output = tbl["output"].as_table();
   auto scan = tbl["scan"].as_table();
+  auto physical = tbl["physical"].as_table();
 
   auto readInt = [](const toml::table *t, const char *k, int &v) {
     if (!t) return;
@@ -481,6 +515,12 @@ AppConfig loadConfig(const std::string &config_path) {
       }
     }
   };
+  auto readBool = [](const toml::table *t, const char *k, bool &v) {
+    if (!t) return;
+    if (auto b = (*t)[k].value<bool>()) {
+      v = *b;
+    }
+  };
 
   readString(sim, "stl_path", cfg.stl_path);
   readInt(sim, "nx", cfg.nx);
@@ -495,6 +535,7 @@ AppConfig loadConfig(const std::string &config_path) {
   readFloat(sim, "scale", cfg.scale);
   readInt(sim, "steps", cfg.steps);
   readInt(sim, "output_every", cfg.output_every);
+  readFloat(sim, "single_depth_R", cfg.single_depth_R);
 
   readString(output, "out_dir", cfg.out_dir);
 
@@ -504,6 +545,17 @@ AppConfig loadConfig(const std::string &config_path) {
 
   readFloatArray(scan, "depth_list", cfg.depth_list);
   readFloatArray(scan, "velocity_list", cfg.velocity_list);
+  readFloatArray(scan, "depth_list_m", cfg.physical.depth_list_m);
+  readFloatArray(scan, "velocity_list_mps", cfg.physical.velocity_list_mps);
+
+  readBool(physical, "enabled", cfg.physical.enabled);
+  readFloat(physical, "domain_lx_m", cfg.physical.domain_lx_m);
+  readFloat(physical, "domain_ly_m", cfg.physical.domain_ly_m);
+  readFloat(physical, "domain_lz_m", cfg.physical.domain_lz_m);
+  readFloat(physical, "u0_mps", cfg.physical.u0_mps);
+  readFloat(physical, "dt_s", cfg.physical.dt_s);
+  readFloat(physical, "capsule_diameter_m", cfg.physical.capsule_diameter_m);
+  readFloat(physical, "single_depth_m", cfg.physical.single_depth_m);
 
   return cfg;
 }
@@ -546,9 +598,13 @@ int main(int argc, char **argv) {
   float fluid_fraction = cfg.fluid_fraction;
   float capsule_x_ratio = cfg.capsule_x_ratio;
   float capsule_depth_ratio = cfg.capsule_depth_ratio;
+  float single_depth_R = cfg.single_depth_R;
   std::vector<float> depth_list = cfg.depth_list;
   std::vector<float> U_list = cfg.velocity_list;
   bool has_runtime_args = false;
+  bool depth_list_from_cli = false;
+  bool velocity_list_from_cli = false;
+  bool u0_from_cli = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
@@ -571,12 +627,15 @@ int main(int argc, char **argv) {
       tau = std::stof(argv[++i]);
     } else if (arg == "--U0") {
       has_runtime_args = true;
+      u0_from_cli = true;
       U0 = std::stof(argv[++i]);
     } else if (arg == "--depth_list") {
       has_runtime_args = true;
+      depth_list_from_cli = true;
       depth_list = parseList(argv[++i]);
     } else if (arg == "--U_list") {
       has_runtime_args = true;
+      velocity_list_from_cli = true;
       U_list = parseList(argv[++i]);
     } else if (arg == "--steps") {
       has_runtime_args = true;
@@ -586,6 +645,58 @@ int main(int argc, char **argv) {
       out_dir = argv[++i];
     }
     // ... (other args support)
+  }
+
+  if (cfg.physical.enabled) {
+    float dx_m = cfg.physical.domain_lx_m / static_cast<float>(std::max(nx, 1));
+    float dy_m = cfg.physical.domain_ly_m / static_cast<float>(std::max(ny, 1));
+    float dz_m = cfg.physical.domain_lz_m / static_cast<float>(std::max(nz, 1));
+    float dt_s = cfg.physical.dt_s;
+
+    if (dt_s <= 0.0f && cfg.physical.u0_mps > 0.0f && U0 > 0.0f && dx_m > 0.0f) {
+      dt_s = U0 * dx_m / cfg.physical.u0_mps;
+    }
+
+    if (!u0_from_cli && cfg.physical.u0_mps > 0.0f && dt_s > 0.0f && dx_m > 0.0f) {
+      U0 = cfg.physical.u0_mps * dt_s / dx_m;
+    }
+
+    if (!depth_list_from_cli && !cfg.physical.depth_list_m.empty() &&
+        cfg.physical.capsule_diameter_m > 0.0f) {
+      depth_list.clear();
+      const float R_m = 0.5f * cfg.physical.capsule_diameter_m;
+      for (float h_m : cfg.physical.depth_list_m) {
+        depth_list.push_back(h_m / R_m);
+      }
+    }
+
+    if (cfg.physical.single_depth_m > 0.0f && cfg.physical.capsule_diameter_m > 0.0f) {
+      const float R_m = 0.5f * cfg.physical.capsule_diameter_m;
+      single_depth_R = cfg.physical.single_depth_m / R_m;
+    }
+
+    if (!velocity_list_from_cli && !cfg.physical.velocity_list_mps.empty() &&
+        dt_s > 0.0f && dx_m > 0.0f) {
+      U_list.clear();
+      for (float u_mps : cfg.physical.velocity_list_mps) {
+        U_list.push_back(u_mps * dt_s / dx_m);
+      }
+    }
+
+    std::cout << "\n[Physical Mapping]\n";
+    std::cout << "Domain(m): Lx=" << cfg.physical.domain_lx_m
+              << ", Ly=" << cfg.physical.domain_ly_m
+              << ", Lz=" << cfg.physical.domain_lz_m << "\n";
+    std::cout << "Grid: nx=" << nx << ", ny=" << ny << ", nz=" << nz << "\n";
+    std::cout << "dx(m): " << dx_m << ", dy(m): " << dy_m << ", dz(m): " << dz_m
+              << "\n";
+    if (dt_s > 0.0f) {
+      std::cout << "dt(s): " << dt_s << "\n";
+      std::cout << "U0 mapping: lattice=" << U0 << " <-> physical="
+                << (U0 * dx_m / dt_s) << " m/s\n";
+    } else {
+      std::cout << "dt(s): unresolved (set [physical].dt_s or [physical].u0_mps)\n";
+    }
   }
 
   if (!has_runtime_args) {
@@ -600,7 +711,7 @@ int main(int argc, char **argv) {
       std::string sub_out = out_dir + "/depth_" + std::to_string(h);
       SimStats stats = run_simulation(
           nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio,
-          capsule_depth_ratio, h, sub_out, 8000, output_every, stl_path,
+          capsule_depth_ratio, h, sub_out, steps, output_every, stl_path,
           spacing_req, mdf_iter, beta, angle, scale, false);
 
       sum_csv << h << "," << stats.max_amp << "," << stats.avg_corr << "\n";
@@ -622,7 +733,7 @@ int main(int argc, char **argv) {
       std::string sub_out = out_dir + "/vel_" + std::to_string(U);
       SimStats stats = run_simulation(
           nx, ny, nz, tau, U, fluid_fraction, capsule_x_ratio, capsule_depth_ratio,
-          -1.0f, sub_out, 8000, output_every, stl_path,
+          -1.0f, sub_out, steps, output_every, stl_path,
           spacing_req, mdf_iter, beta, angle, scale, false);
 
       float Fr = U / sqrt(g * D);
@@ -632,7 +743,7 @@ int main(int argc, char **argv) {
     }
     std::cout << "Velocity scan complete used configured list.\n";
   } else {
-    if (!depth_list.empty()) {
+    if (depth_list_from_cli) {
       std::ofstream sum_csv("summary_depth.csv");
       sum_csv << "h/R,A_max,Corr\n";
       for (float h : depth_list) {
@@ -644,7 +755,7 @@ int main(int argc, char **argv) {
         sum_csv << h << "," << stats.max_amp << "," << stats.avg_corr << "\n";
       }
       std::cout << "Depth scan complete. Saved to summary_depth.csv\n";
-    } else if (!U_list.empty()) {
+    } else if (velocity_list_from_cli) {
       std::ofstream sum_csv("summary_velocity.csv");
       sum_csv << "U,Fr,A_max,Corr\n";
       STLMesh mesh;
@@ -664,7 +775,7 @@ int main(int argc, char **argv) {
       std::cout << "Velocity scan complete. Saved to summary_velocity.csv\n";
     } else {
       run_simulation(nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio,
-                     capsule_depth_ratio, -1.0f, out_dir, steps, output_every,
+                     capsule_depth_ratio, single_depth_R, out_dir, steps, output_every,
                      stl_path, spacing_req, mdf_iter, beta, angle, scale, true);
     }
   }

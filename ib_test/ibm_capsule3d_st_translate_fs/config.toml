@@ -1,26 +1,75 @@
 [simulation]
+# Path to STL file [dimension: N/A]
 stl_path = "../../tools/capsule.stl"
+# Grid resolution in X direction [dimension: count]
 nx = 512
+# Grid resolution in Y direction [dimension: count]
 ny = 128
+# Grid resolution in Z direction [dimension: count]
 nz = 128
+# LBM relaxation time [dimension: dimensionless]
 tau = 0.8
+# LBM lattice velocity scale [dimension: lattice_length / lattice_time, dimensionless in physical SI]
+# Auto-mapped from [physical].u0_mps when physical.enabled = true
 U0 = 0.08
+# Marker sampling spacing on mesh surface [dimension: lattice_length]
 spacing_req = 1.0
+# MDF iteration count [dimension: count]
 mdf_iter = 5
+# MDF beta coefficient [dimension: dimensionless]
 beta = -0.5
+# Rotation angle around Z [dimension: degree]
 angle = 0.0
+# STL geometric scaling factor [dimension: dimensionless]
 scale = 1.0
+# Total simulation steps [dimension: count]
 steps = 5000
+# Output interval in steps [dimension: count]
 output_every = 100
+# Single-run depth as h/R [dimension: dimensionless], -1 => use capsule_depth_ratio logic
+single_depth_R = -1.0
 
 [geometry]
+# Initial liquid height fraction of domain height [dimension: dimensionless]
 fluid_fraction = 0.7
+# Initial capsule center X position as fraction of domain length [dimension: dimensionless]
 capsule_x_ratio = 0.15
+# Initial capsule submergence ratio relative to water level (legacy mode) [dimension: dimensionless]
 capsule_depth_ratio = 0.5
 
 [output]
+# Output root directory [dimension: N/A]
 out_dir = "out/capsule_fs"
 
 [scan]
+# Depth scan list in h/R [dimension: dimensionless]
 depth_list = [1.5, 2.0, 3.0, 4.0, 5.0]
+# Velocity scan list in lattice units [dimension: lattice_length / lattice_time]
 velocity_list = [0.04, 0.06, 0.08]
+# Depth scan list in physical space [dimension: meter]
+depth_list_m = [1.5, 2.0, 3.0]
+# Velocity scan list in physical space [dimension: meter / second]
+velocity_list_mps = [6.0, 8.0, 10.0]
+
+[physical]
+# Enable mapping between physical SI inputs and lattice simulation units [dimension: boolean]
+enabled = true
+
+# Physical domain length in X [dimension: meter]
+domain_lx_m = 100.0
+# Physical domain length in Y [dimension: meter]
+domain_ly_m = 25.0
+# Physical domain length in Z [dimension: meter]
+domain_lz_m = 25.0
+
+# Target physical submarine speed [dimension: meter / second]
+u0_mps = 10.0
+
+# Physical time step [dimension: second], 0 => infer from U0/u0_mps/domain_lx_m
+dt_s = 0.0
+
+# Physical capsule diameter used for depth conversion [dimension: meter]
+capsule_diameter_m = 6.0
+
+# Single-run submergence depth below free surface [dimension: meter], <=0 disables
+single_depth_m = -1.0

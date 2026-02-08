@@ -149,6 +149,12 @@ add_executable(ibm_capsule3d_st_translate_fs
     ../src/services/MarkerVTKService.cpp
     diagnostics/free_surface_diagnostics.cuh
 )
+target_sources(ibm_capsule3d_st_translate_fs PRIVATE
+    ${IBM_CAPSULE3D_ST_TRANSLATE_FS_DIR}/config.toml
+)
+source_group("Source Files" FILES
+    ${IBM_CAPSULE3D_ST_TRANSLATE_FS_DIR}/config.toml
+)
 set_target_properties(ibm_capsule3d_st_translate_fs PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
 target_link_libraries(ibm_capsule3d_st_translate_fs PRIVATE physics services ${CUDA_LIBRARIES})
 target_include_directories(ibm_capsule3d_st_translate_fs PRIVATE 
