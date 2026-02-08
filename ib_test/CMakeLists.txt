@@ -39,7 +39,6 @@ gtest_discover_tests(test_ibm_fundamentals)
 # ==============================================================================
 add_executable(test_ibm_mdf
     test_ibm_mdf.cu
-    ../src/physics/ibm/IBMCore.cu
 )
 
 set_target_properties(test_ibm_mdf PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
@@ -53,12 +52,9 @@ target_compile_definitions(test_ibm_mdf PRIVATE IBM_TESTING)
 # ==========================================
 # IBM Couette 3D Regression Test
 # ==========================================
-# ==========================================
-# IBM Couette 3D Regression Test
-# ==========================================
 
 # Couette Flow
-add_executable(ibm_couette3d ibm_couette3d.cu ../src/physics/ibm/IBMCore.cu)
+add_executable(ibm_couette3d ibm_couette3d.cu)
 set_target_properties(ibm_couette3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(ibm_couette3d PRIVATE physics ${CUDA_LIBRARIES})
 target_include_directories(ibm_couette3d PRIVATE 
@@ -69,7 +65,7 @@ target_include_directories(ibm_couette3d PRIVATE
 )
 
 # Poiseuille Flow
-add_executable(ibm_poiseuille3d ibm_poiseuille3d.cu ../src/physics/ibm/IBMCore.cu)
+add_executable(ibm_poiseuille3d ibm_poiseuille3d.cu)
 set_target_properties(ibm_poiseuille3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(ibm_poiseuille3d PRIVATE physics ${CUDA_LIBRARIES})
 target_include_directories(ibm_poiseuille3d PRIVATE 
@@ -81,7 +77,7 @@ target_include_directories(ibm_poiseuille3d PRIVATE
 target_compile_definitions(ibm_poiseuille3d PRIVATE IBM_TESTING)
 
 # Sphere Drag 3D
-add_executable(ibm_sphere_drag3d ibm_sphere_drag3d.cu ../src/physics/ibm/IBMCore.cu)
+add_executable(ibm_sphere_drag3d ibm_sphere_drag3d.cu)
 set_target_properties(ibm_sphere_drag3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
 target_link_libraries(ibm_sphere_drag3d PRIVATE physics ${CUDA_LIBRARIES})
 target_include_directories(ibm_sphere_drag3d PRIVATE 
@@ -95,12 +91,10 @@ target_compile_definitions(ibm_sphere_drag3d PRIVATE IBM_TESTING)
 # Sphere Translate 3D
 add_executable(ibm_sphere_translate3d 
     ibm_sphere_translate3d.cu 
-    ../src/physics/ibm/IBMCore.cu
-    ../src/services/VTKService.cpp
     ../src/services/MarkerVTKService.cpp
 )
 set_target_properties(ibm_sphere_translate3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
-target_link_libraries(ibm_sphere_translate3d PRIVATE physics ${CUDA_LIBRARIES})
+target_link_libraries(ibm_sphere_translate3d PRIVATE physics services ${CUDA_LIBRARIES})
 target_include_directories(ibm_sphere_translate3d PRIVATE 
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/physics
@@ -119,6 +113,7 @@ target_compile_features(test_ibm_mdf PRIVATE cxx_std_17)
 target_link_libraries(test_ibm_mdf PRIVATE 
     GTest::gtest 
     GTest::gtest_main
+    physics
 )
 
 
@@ -129,9 +124,6 @@ gtest_discover_tests(test_ibm_mdf)
 # ==========================================
 add_executable(ibm_capsule3d_st_translate 
     ibm_capsule3d_st_translate.cu 
-    ../src/physics/ibm/IBMCore.cu
-    ../src/geometry/STLGeometryLoader.cpp
-    ../src/services/VTKService.cpp
     ../src/services/MarkerVTKService.cpp
 )
 set_target_properties(ibm_capsule3d_st_translate PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
@@ -152,9 +144,6 @@ target_compile_definitions(ibm_capsule3d_st_translate PRIVATE IBM_TESTING)
 # ==========================================
 add_executable(ibm_capsule3d_st_translate_fs 
     ibm_capsule3d_st_translate_fs.cu 
-    ../src/physics/ibm/IBMCore.cu
-    ../src/geometry/STLGeometryLoader.cpp
-    ../src/services/VTKService.cpp
     ../src/services/MarkerVTKService.cpp
     diagnostics/free_surface_diagnostics.cuh
 )
