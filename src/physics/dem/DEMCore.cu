@@ -1023,10 +1023,12 @@ void DEMCore::buildSpatialGrid() {
     int threads = 256;
     int blocks  = (N + threads - 1) / threads;
 
-    printf("[DEMCore::buildSpatialGrid] N=%d blocks=%d threads=%d cell_size=%.4e grid=(%d,%d,%d)\n",
-           N, blocks, threads, cell_size_, grid_nx_, grid_ny_, grid_nz_);
-    printf("d_pos=%p d_cell_id=%p\n", d_pos_, d_cell_id_);
-    fflush(stdout);
+    if (cfg_.log_spatial_grid) {
+        printf("[DEMCore::buildSpatialGrid] N=%d blocks=%d threads=%d cell_size=%.4e grid=(%d,%d,%d)\n",
+               N, blocks, threads, cell_size_, grid_nx_, grid_ny_, grid_nz_);
+        printf("d_pos=%p d_cell_id=%p\n", d_pos_, d_cell_id_);
+        fflush(stdout);
+    }
 
     // 1. Compute cell_id and initialize sorted_idx = identity
     kComputeCellId<<<blocks, threads>>>(

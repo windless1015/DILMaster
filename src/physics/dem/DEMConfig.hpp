@@ -123,6 +123,7 @@ struct DEMConfig {
 
     // -- Debug / safety --
     bool  use_naive_n2     = false;     ///< Force N^2 collision (debug only)
+    bool  log_spatial_grid = false;     ///< Print spatial-grid build info every substep (very verbose)
     float max_overlap_warn = 0.2f;      ///< Warn if overlap > this fraction of radius
 };
 

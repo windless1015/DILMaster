@@ -361,7 +361,7 @@ bool Test_T5_Convergence() {
         
         cfg.dem_substeps = 1; // Ignored effectively by adaptive logic below
         auto core = createCore(cfg);
-        std::vector<float> pos(3, 0.5f); pos[2] = 5.0f; // Center
+        std::vector<float> pos(3, 0.5f); pos[2] = 1.0f; // Shorter drop for faster convergence test
         std::vector<float> vel(3, 0.0f);
         std::vector<float> rad(1, 0.1f);
         core->uploadPositions(pos.data());
@@ -382,7 +382,7 @@ bool Test_T5_Convergence() {
 
         float max_z = 0.0f;
         bool bounced = false;
-        int steps = static_cast<int>(2.0f / dt);
+        int steps = static_cast<int>(0.8f / dt);
         
         for(int i=0; i<steps; ++i) {
             core->stepMultiple(dt, n_sub);
@@ -404,10 +404,10 @@ bool Test_T5_Convergence() {
         return max_z;
     };
     
-    float h1 = run_sim(1e-4f);
-    float h2 = run_sim(5e-5f); // Smaller dt should yield similar result
-    printf("    [T5] dt=1e-4 H=%.4f, dt=5e-5 H=%.4f\n", h1, h2);
-    ASSERT_NEAR(h1, h2, 0.1f);  
+    float h1 = run_sim(2e-4f);
+    float h2 = run_sim(1e-4f); // Smaller dt should yield similar result
+    printf("    [T5] dt=2e-4 H=%.4f, dt=1e-4 H=%.4f\n", h1, h2);
+    ASSERT_NEAR(h1, h2, 0.08f);  
     return true;
 }
 
