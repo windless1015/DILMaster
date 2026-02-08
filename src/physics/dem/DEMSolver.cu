@@ -2,6 +2,27 @@
 #include "DEMCore.hpp"
 #include "DEMSolver.hpp"
 #include <iostream>
+#include <vector>
+
+namespace {
+std::vector<float> aosToSoA(const float3* aos, std::size_t n) {
+  std::vector<float> soa(3 * n, 0.0f);
+  for (std::size_t i = 0; i < n; ++i) {
+    soa[i] = aos[i].x;
+    soa[n + i] = aos[i].y;
+    soa[2 * n + i] = aos[i].z;
+  }
+  return soa;
+}
+
+void soaToAoS(const float* soa, float3* aos, std::size_t n) {
+  for (std::size_t i = 0; i < n; ++i) {
+    aos[i].x = soa[i];
+    aos[i].y = soa[n + i];
+    aos[i].z = soa[2 * n + i];
+  }
+}
+} // namespace
 
 DEMSolver::DEMSolver() = default;
 DEMSolver::~DEMSolver() = default;
@@ -68,9 +89,11 @@ void DEMSolver::allocate(StepContext &ctx) {
 
 void DEMSolver::initialize(StepContext &ctx) {
   if (!fields_allocated_ || !core_) return;
+  const std::size_t n = config_.num_particles;
 
   // 1. Initialize FieldStore data (if not already set by Scenario)
   auto posF = ctx.fields->get(DEMFields::POSITION);
+  auto velF = ctx.fields->get(DEMFields::VELOCITY);
   auto radF = ctx.fields->get(DEMFields::RADIUS);
   
   float* h_radius = static_cast<float*>(radF.data());
@@ -80,9 +103,11 @@ void DEMSolver::initialize(StepContext &ctx) {
   }
 
   // 2. Upload initial state from FieldStore to GPU
-  // Assumption: Positions have been set by the Scenario/Generator
-  core_->uploadPositions(static_cast<float*>(posF.data()));
-  core_->uploadVelocities(static_cast<float*>(ctx.fields->get(DEMFields::VELOCITY).data()));
+  // FieldStore stores float3 AoS, while DEMCore expects SoA [x... y... z...]
+  auto pos_soa = aosToSoA(static_cast<float3*>(posF.data()), n);
+  auto vel_soa = aosToSoA(static_cast<float3*>(velF.data()), n);
+  core_->uploadPositions(pos_soa.data());
+  core_->uploadVelocities(vel_soa.data());
   core_->uploadRadii(h_radius);
 
   // 3. Compute derived mass properties on GPU
@@ -94,6 +119,7 @@ void DEMSolver::initialize(StepContext &ctx) {
 
 void DEMSolver::step(StepContext &ctx) {
   if (!core_) return;
+  const std::size_t n = config_.num_particles;
 
   // 1. Sync Coupling Forces: FieldStore (Host) -> DEMCore (Device)
   // We need to upload EXTERNAL forces that were reduced onto particles (e.g. drag)
@@ -107,10 +133,10 @@ void DEMSolver::step(StepContext &ctx) {
   
   // 1. Sync Coupling Forces: FieldStore (Host) -> DEMCore (Device)
   auto forceF = ctx.fields->get(DEMFields::FORCE);
-  float* h_force = static_cast<float*>(forceF.data());
+  auto force_soa = aosToSoA(static_cast<float3*>(forceF.data()), n);
   
   // Inject into DEMCore (added in refactor)
-  core_->uploadExternalForces(h_force);
+  core_->uploadExternalForces(force_soa.data());
   
   // 2. Execute Physics (Adaptive Substepping)
   // Textbook accuracy requires resolving the contact duration t_c.
@@ -138,12 +164,16 @@ void DEMSolver::step(StepContext &ctx) {
   // 3. Sync Results: DEMCore (Device) -> FieldStore (Host)
   auto posF = ctx.fields->get(DEMFields::POSITION);
   auto velF = ctx.fields->get(DEMFields::VELOCITY);
-  
-  core_->downloadPositions(static_cast<float*>(posF.data()));
-  core_->downloadVelocities(static_cast<float*>(velF.data()));
-  
-  // Also download forces for visualization?
-  core_->downloadForces(static_cast<float*>(forceF.data()));
+
+  std::vector<float> pos_soa(3 * n, 0.0f);
+  std::vector<float> vel_soa(3 * n, 0.0f);
+  std::vector<float> frc_soa(3 * n, 0.0f);
+  core_->downloadPositions(pos_soa.data());
+  core_->downloadVelocities(vel_soa.data());
+  core_->downloadForces(frc_soa.data());
+  soaToAoS(pos_soa.data(), static_cast<float3*>(posF.data()), n);
+  soaToAoS(vel_soa.data(), static_cast<float3*>(velF.data()), n);
+  soaToAoS(frc_soa.data(), static_cast<float3*>(forceF.data()), n);
 }
 
 void DEMSolver::finalize(StepContext &ctx) {

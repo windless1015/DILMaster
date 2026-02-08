@@ -160,6 +160,8 @@ void IBMSolver::allocate(StepContext &ctx) {
   ibm::IBMParams params;
   params.nMarkers = n;
   params.stencil_width = config_.stencil_width;
+  params.mdf_beta = config_.mdf_beta;
+  params.mdf_iterations = config_.mdf_iterations;
   core_ = std::make_unique<ibm::IBMCore>(params);
 }
 
