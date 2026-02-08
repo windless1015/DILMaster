@@ -1,0 +1,26 @@
+[simulation]
+stl_path = "../../tools/capsule.stl"
+nx = 512
+ny = 128
+nz = 128
+tau = 0.8
+U0 = 0.08
+spacing_req = 1.0
+mdf_iter = 5
+beta = -0.5
+angle = 0.0
+scale = 1.0
+steps = 5000
+output_every = 100
+
+[geometry]
+fluid_fraction = 0.7
+capsule_x_ratio = 0.15
+capsule_depth_ratio = 0.5
+
+[output]
+out_dir = "out/capsule_fs"
+
+[scan]
+depth_list = [1.5, 2.0, 3.0, 4.0, 5.0]
+velocity_list = [0.04, 0.06, 0.08]

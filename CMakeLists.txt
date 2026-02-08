@@ -31,6 +31,35 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 find_package(CUDAToolkit REQUIRED)
 
 # ------------------------------------------------------------------------------
+# toml++ (local thirdparty preferred, fallback to FetchContent)
+# ------------------------------------------------------------------------------
+set(TOMLPP_LOCAL_DIR "${CMAKE_SOURCE_DIR}/thirdparty/tomlplusplus")
+set(TOMLPP_LOCAL_HEADER "${TOMLPP_LOCAL_DIR}/include/toml++/toml.hpp")
+
+if(EXISTS "${TOMLPP_LOCAL_HEADER}")
+  add_subdirectory("${TOMLPP_LOCAL_DIR}" "${CMAKE_BINARY_DIR}/_deps/tomlplusplus-build")
+else()
+  include(FetchContent)
+  FetchContent_Declare(
+    tomlplusplus
+    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+    GIT_TAG v3.4.0
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(tomlplusplus)
+endif()
+
+if(NOT TARGET tomlplusplus::tomlplusplus)
+  if(TARGET tomlplusplus_tomlplusplus)
+    add_library(tomlplusplus::tomlplusplus ALIAS tomlplusplus_tomlplusplus)
+  elseif(TARGET tomlplusplus)
+    add_library(tomlplusplus::tomlplusplus ALIAS tomlplusplus)
+  else()
+    message(FATAL_ERROR "toml++ target not found after add_subdirectory/FetchContent.")
+  endif()
+endif()
+
+# ------------------------------------------------------------------------------
 # Physics Library (LBM Module)
 # ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
@@ -68,6 +97,7 @@ target_include_directories(physics PUBLIC
 
 target_link_libraries(physics PUBLIC
   CUDA::cudart
+  tomlplusplus::tomlplusplus
 )
 
 set_target_properties(physics PROPERTIES
@@ -88,6 +118,7 @@ target_include_directories(services PUBLIC
 
 target_link_libraries(services PUBLIC
   physics
+  tomlplusplus::tomlplusplus
 )
 
 # ------------------------------------------------------------------------------

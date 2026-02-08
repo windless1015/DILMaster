@@ -142,8 +142,10 @@ target_compile_definitions(ibm_capsule3d_st_translate PRIVATE IBM_TESTING)
 # ==========================================
 # STL Capsule 3D Translate + Free Surface
 # ==========================================
+set(IBM_CAPSULE3D_ST_TRANSLATE_FS_DIR
+    ${CMAKE_CURRENT_SOURCE_DIR}/ibm_capsule3d_st_translate_fs)
 add_executable(ibm_capsule3d_st_translate_fs 
-    ibm_capsule3d_st_translate_fs.cu 
+    ${IBM_CAPSULE3D_ST_TRANSLATE_FS_DIR}/ibm_capsule3d_st_translate_fs.cu
     ../src/services/MarkerVTKService.cpp
     diagnostics/free_surface_diagnostics.cuh
 )
@@ -159,3 +161,6 @@ target_include_directories(ibm_capsule3d_st_translate_fs PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core
 )
 target_compile_definitions(ibm_capsule3d_st_translate_fs PRIVATE IBM_TESTING)
+target_compile_definitions(ibm_capsule3d_st_translate_fs PRIVATE
+    IBM_CAPSULE3D_ST_TRANSLATE_FS_CONFIG="${IBM_CAPSULE3D_ST_TRANSLATE_FS_DIR}/config.toml"
+)

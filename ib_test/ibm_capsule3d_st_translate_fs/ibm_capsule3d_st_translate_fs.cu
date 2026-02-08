@@ -11,23 +11,24 @@
 #include <string>
 #include <vector>
 
-#include "../src/geometry/STLGeometryLoader.hpp"
-#include "../src/geometry/STLReader.h"
-#include "../src/geometry/VectorTypes.h"
-#include "../src/physics/ibm/IBMCore.hpp"
-#include "../src/physics/lbm/FreeSurfaceModule.hpp"
-#include "../src/physics/lbm/LBMConfig.hpp"
-#include "../src/physics/lbm/LBMCore.hpp"
+#include "../../src/geometry/STLGeometryLoader.hpp"
+#include "../../src/geometry/STLReader.h"
+#include "../../src/geometry/VectorTypes.h"
+#include "../../src/physics/ibm/IBMCore.hpp"
+#include "../../src/physics/lbm/FreeSurfaceModule.hpp"
+#include "../../src/physics/lbm/LBMConfig.hpp"
+#include "../../src/physics/lbm/LBMCore.hpp"
 #include <cuda_runtime.h>
+#include <toml++/toml.hpp>
 
 // Services for Time-Series VTK Output
-#include "../src/core/FieldStore.hpp"
-#include "../src/core/StepContext.hpp"
-#include "../src/services/MarkerVTKService.hpp"
-#include "../src/services/VTKService.hpp"
+#include "../../src/core/FieldStore.hpp"
+#include "../../src/core/StepContext.hpp"
+#include "../../src/services/MarkerVTKService.hpp"
+#include "../../src/services/VTKService.hpp"
 
 // DIAGNOSTICS MODULE
-#include "diagnostics/free_surface_diagnostics.cuh"
+#include "../diagnostics/free_surface_diagnostics.cuh"
 
 namespace fs = std::filesystem;
 
@@ -409,42 +410,189 @@ std::vector<float> parseList(std::string str) {
   return res;
 }
 
+struct AppConfig {
+  std::string stl_path;
+  int nx;
+  int ny;
+  int nz;
+  float tau;
+  float U0;
+  float spacing_req;
+  int mdf_iter;
+  float beta;
+  float angle;
+  float scale;
+  int steps;
+  int output_every;
+  std::string out_dir;
+  float fluid_fraction;
+  float capsule_x_ratio;
+  float capsule_depth_ratio;
+  std::vector<float> depth_list;
+  std::vector<float> velocity_list;
+};
+
+#ifndef IBM_CAPSULE3D_ST_TRANSLATE_FS_CONFIG
+#define IBM_CAPSULE3D_ST_TRANSLATE_FS_CONFIG "config.toml"
+#endif
+
+AppConfig loadConfig(const std::string &config_path) {
+  AppConfig cfg{
+      "../../tools/capsule.stl", 512, 128, 128, 0.8f, 0.08f, 1.0f, 5,    -0.5f,
+      0.0f,                    1.0f, 5000, 100, "out/capsule_fs", 0.7f, 0.15f,
+      0.5f,                    {1.5f, 2.0f, 3.0f, 4.0f, 5.0f}, {0.04f, 0.06f, 0.08f}};
+
+  toml::table tbl = toml::parse_file(config_path);
+  auto sim = tbl["simulation"].as_table();
+  auto geom = tbl["geometry"].as_table();
+  auto output = tbl["output"].as_table();
+  auto scan = tbl["scan"].as_table();
+
+  auto readInt = [](const toml::table *t, const char *k, int &v) {
+    if (!t) return;
+    if (auto val = (*t)[k].value<std::int64_t>()) {
+      v = static_cast<int>(*val);
+    }
+  };
+  auto readFloat = [](const toml::table *t, const char *k, float &v) {
+    if (!t) return;
+    if (auto d = (*t)[k].value<double>()) {
+      v = static_cast<float>(*d);
+    } else if (auto i = (*t)[k].value<std::int64_t>()) {
+      v = static_cast<float>(*i);
+    }
+  };
+  auto readString = [](const toml::table *t, const char *k, std::string &v) {
+    if (!t) return;
+    if (auto s = (*t)[k].value<std::string>()) {
+      v = *s;
+    }
+  };
+  auto readFloatArray = [](const toml::table *t, const char *k, std::vector<float> &v) {
+    if (!t) return;
+    const auto *arr = (*t)[k].as_array();
+    if (!arr) return;
+    v.clear();
+    for (const auto &node : *arr) {
+      if (auto d = node.value<double>()) {
+        v.push_back(static_cast<float>(*d));
+      } else if (auto i = node.value<std::int64_t>()) {
+        v.push_back(static_cast<float>(*i));
+      }
+    }
+  };
+
+  readString(sim, "stl_path", cfg.stl_path);
+  readInt(sim, "nx", cfg.nx);
+  readInt(sim, "ny", cfg.ny);
+  readInt(sim, "nz", cfg.nz);
+  readFloat(sim, "tau", cfg.tau);
+  readFloat(sim, "U0", cfg.U0);
+  readFloat(sim, "spacing_req", cfg.spacing_req);
+  readInt(sim, "mdf_iter", cfg.mdf_iter);
+  readFloat(sim, "beta", cfg.beta);
+  readFloat(sim, "angle", cfg.angle);
+  readFloat(sim, "scale", cfg.scale);
+  readInt(sim, "steps", cfg.steps);
+  readInt(sim, "output_every", cfg.output_every);
+
+  readString(output, "out_dir", cfg.out_dir);
+
+  readFloat(geom, "fluid_fraction", cfg.fluid_fraction);
+  readFloat(geom, "capsule_x_ratio", cfg.capsule_x_ratio);
+  readFloat(geom, "capsule_depth_ratio", cfg.capsule_depth_ratio);
+
+  readFloatArray(scan, "depth_list", cfg.depth_list);
+  readFloatArray(scan, "velocity_list", cfg.velocity_list);
+
+  return cfg;
+}
+
 int main(int argc, char **argv) {
   std::cout << "--- FreeSurface Validation Enabled ---" << std::endl;
   std::cout << "Expect drawdown over body if negative pressure region exists."
             << std::endl;
 
-  // Defaults
-  std::string stl_path = "../../tools/capsule.stl";
-  int nx = 512, ny = 128, nz = 128; // Increased Z for depth
-  float tau = 0.8f;
-  float U0 = 0.08f;
-  float spacing_req = 1.0f;
-  int mdf_iter = 5;
-  float beta = -0.5f;
-  float angle = 0.0f;
-  float scale = 1.0f;
-  int steps = 5000;
-  int output_every = 100;
-  std::string out_dir = "out/capsule_fs";
-  float fluid_fraction = 0.7f;
-  float capsule_x_ratio = 0.15f;
-  float capsule_depth_ratio = 0.5f;
+  std::string config_path = IBM_CAPSULE3D_ST_TRANSLATE_FS_CONFIG;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--config" && i + 1 < argc) {
+      config_path = argv[++i];
+    }
+  }
 
-  // Loop lists
-  std::string depth_list_str = "";
-  std::string U_list_str = "";
+  AppConfig cfg;
+  try {
+    cfg = loadConfig(config_path);
+    std::cout << "Loaded config: " << config_path << std::endl;
+  } catch (const std::exception &e) {
+    std::cerr << "Failed to load config '" << config_path << "': " << e.what()
+              << std::endl;
+    return 1;
+  }
 
-  // Args Parsing
-  if (argc <= 1) {
-    // VS Default Mode: Activate Scans
+  std::string stl_path = cfg.stl_path;
+  int nx = cfg.nx, ny = cfg.ny, nz = cfg.nz;
+  float tau = cfg.tau;
+  float U0 = cfg.U0;
+  float spacing_req = cfg.spacing_req;
+  int mdf_iter = cfg.mdf_iter;
+  float beta = cfg.beta;
+  float angle = cfg.angle;
+  float scale = cfg.scale;
+  int steps = cfg.steps;
+  int output_every = cfg.output_every;
+  std::string out_dir = cfg.out_dir;
+  float fluid_fraction = cfg.fluid_fraction;
+  float capsule_x_ratio = cfg.capsule_x_ratio;
+  float capsule_depth_ratio = cfg.capsule_depth_ratio;
+  std::vector<float> depth_list = cfg.depth_list;
+  std::vector<float> U_list = cfg.velocity_list;
+  bool has_runtime_args = false;
+
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--config") {
+      ++i;
+    } else if (arg == "--stl") {
+      has_runtime_args = true;
+      stl_path = argv[++i];
+    } else if (arg == "--nx") {
+      has_runtime_args = true;
+      nx = std::stoi(argv[++i]);
+    } else if (arg == "--ny") {
+      has_runtime_args = true;
+      ny = std::stoi(argv[++i]);
+    } else if (arg == "--nz") {
+      has_runtime_args = true;
+      nz = std::stoi(argv[++i]);
+    } else if (arg == "--tau") {
+      has_runtime_args = true;
+      tau = std::stof(argv[++i]);
+    } else if (arg == "--U0") {
+      has_runtime_args = true;
+      U0 = std::stof(argv[++i]);
+    } else if (arg == "--depth_list") {
+      has_runtime_args = true;
+      depth_list = parseList(argv[++i]);
+    } else if (arg == "--U_list") {
+      has_runtime_args = true;
+      U_list = parseList(argv[++i]);
+    } else if (arg == "--steps") {
+      has_runtime_args = true;
+      steps = std::stoi(argv[++i]);
+    } else if (arg == "--outDir") {
+      has_runtime_args = true;
+      out_dir = argv[++i];
+    }
+    // ... (other args support)
+  }
+
+  if (!has_runtime_args) {
     std::cout
-        << "\n[VS Mode] No arguments detected. Running automated diagnostics "
-           "scans...\n";
+        << "\n[Config Mode] No runtime args detected. Running configured scans...\n";
 
-    // 1. Depth Scan
-    std::vector<float> depth_list = {1.5f, 2.0f, 3.0f, 4.0f, 5.0f};
-    std::ofstream sum_csv(out_dir + "/summary_depth.csv");
+    std::ofstream sum_csv("summary_depth.csv");
     sum_csv << "h/R,A_max,Corr\n";
 
     for (float h : depth_list) {
@@ -452,18 +600,15 @@ int main(int argc, char **argv) {
       std::string sub_out = out_dir + "/depth_" + std::to_string(h);
       SimStats stats = run_simulation(
           nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio,
-          capsule_depth_ratio, h, sub_out, 8000,
-          output_every, // 8000 steps sufficient
-          stl_path, spacing_req, mdf_iter, beta, angle, scale, false);
+          capsule_depth_ratio, h, sub_out, 8000, output_every, stl_path,
+          spacing_req, mdf_iter, beta, angle, scale, false);
 
       sum_csv << h << "," << stats.max_amp << "," << stats.avg_corr << "\n";
       sum_csv.flush();
     }
-    std::cout << "Depth scan complete used default list.\n";
+    std::cout << "Depth scan complete used configured list.\n";
 
-    // 2. Velocity Scan
-    std::vector<float> U_list = {0.04f, 0.06f, 0.08f};
-    std::ofstream sum_v_csv(out_dir + "/summary_velocity.csv");
+    std::ofstream sum_v_csv("summary_velocity.csv");
     sum_v_csv << "U,Fr,A_max,Corr\n";
 
     // Need Length for Fr. Load STL to get D? Or reuse D.
@@ -476,8 +621,8 @@ int main(int argc, char **argv) {
       std::cout << "\n>>> AUTO: Running Velocity U = " << U << " <<<\n";
       std::string sub_out = out_dir + "/vel_" + std::to_string(U);
       SimStats stats = run_simulation(
-          nx, ny, nz, tau, U, fluid_fraction, capsule_x_ratio,
-          capsule_depth_ratio, -1.0f, sub_out, 8000, output_every, stl_path,
+          nx, ny, nz, tau, U, fluid_fraction, capsule_x_ratio, capsule_depth_ratio,
+          -1.0f, sub_out, 8000, output_every, stl_path,
           spacing_req, mdf_iter, beta, angle, scale, false);
 
       float Fr = U / sqrt(g * D);
@@ -485,83 +630,43 @@ int main(int argc, char **argv) {
                 << stats.avg_corr << "\n";
       sum_v_csv.flush();
     }
-    std::cout << "Velocity scan complete used default list.\n";
-
-    return 0;
-  }
-
-  for (int i = 1; i < argc; ++i) {
-    std::string arg = argv[i];
-    if (arg == "--stl")
-      stl_path = argv[++i];
-    else if (arg == "--nx")
-      nx = std::stoi(argv[++i]);
-    else if (arg == "--ny")
-      ny = std::stoi(argv[++i]);
-    else if (arg == "--nz")
-      nz = std::stoi(argv[++i]);
-    else if (arg == "--tau")
-      tau = std::stof(argv[++i]);
-    else if (arg == "--U0")
-      U0 = std::stof(argv[++i]);
-    else if (arg == "--depth_list")
-      depth_list_str = argv[++i];
-    else if (arg == "--U_list")
-      U_list_str = argv[++i];
-    else if (arg == "--steps")
-      steps = std::stoi(argv[++i]);
-    else if (arg == "--outDir")
-      out_dir = argv[++i];
-    // ... (other args support)
-  }
-
-  if (!depth_list_str.empty()) {
-    auto list = parseList(depth_list_str);
-    std::ofstream sum_csv("summary_depth.csv");
-    sum_csv << "h/R,A_max,Corr\n";
-
-    for (float h : list) {
-      std::cout << "\n>>> AUTO: Running Depth h/R = " << h << " <<<\n";
-      std::string sub_out = out_dir + "/depth_" + std::to_string(h);
-      SimStats stats = run_simulation(
-          nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio,
-          capsule_depth_ratio, h, sub_out, steps, output_every, stl_path,
-          spacing_req, mdf_iter, beta, angle, scale, false);
-
-      sum_csv << h << "," << stats.max_amp << "," << stats.avg_corr << "\n";
-      sum_csv.flush();
-    }
-    std::cout << "Depth scan complete. Saved to summary_depth.csv\n";
-  } else if (!U_list_str.empty()) {
-    auto list = parseList(U_list_str);
-    std::ofstream sum_csv("summary_velocity.csv");
-    sum_csv << "U,Fr,A_max,Corr\n";
-
-    // Need Length for Fr. Load STL to get D? Or reuse D.
-    STLMesh mesh;
-    STLReader::readSTL(stl_path, mesh);
-    float D = mesh.getSize().y; // Assuming Y is D as per prior code
-    float g = 0.0001f;
-
-    for (float U : list) {
-      std::cout << "\n>>> AUTO: Running Velocity U = " << U << " <<<\n";
-      std::string sub_out = out_dir + "/vel_" + std::to_string(U);
-      SimStats stats = run_simulation(
-          nx, ny, nz, tau, U, fluid_fraction, capsule_x_ratio,
-          capsule_depth_ratio, -1.0f, sub_out, steps, output_every, stl_path,
-          spacing_req, mdf_iter, beta, angle, scale, false);
-
-      float Fr = U / sqrt(g * D);
-      sum_csv << U << "," << Fr << "," << stats.max_amp << "," << stats.avg_corr
-              << "\n";
-      sum_csv.flush();
-    }
-    std::cout << "Velocity scan complete. Saved to summary_velocity.csv\n";
+    std::cout << "Velocity scan complete used configured list.\n";
   } else {
-    // Single Run
-    run_simulation(nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio,
-                   capsule_depth_ratio, -1.0f, out_dir, steps, output_every,
-                   stl_path, spacing_req, mdf_iter, beta, angle, scale, true);
+    if (!depth_list.empty()) {
+      std::ofstream sum_csv("summary_depth.csv");
+      sum_csv << "h/R,A_max,Corr\n";
+      for (float h : depth_list) {
+        std::string sub_out = out_dir + "/depth_" + std::to_string(h);
+        SimStats stats = run_simulation(
+            nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio, capsule_depth_ratio, h,
+            sub_out, steps, output_every, stl_path, spacing_req, mdf_iter, beta, angle,
+            scale, false);
+        sum_csv << h << "," << stats.max_amp << "," << stats.avg_corr << "\n";
+      }
+      std::cout << "Depth scan complete. Saved to summary_depth.csv\n";
+    } else if (!U_list.empty()) {
+      std::ofstream sum_csv("summary_velocity.csv");
+      sum_csv << "U,Fr,A_max,Corr\n";
+      STLMesh mesh;
+      STLReader::readSTL(stl_path, mesh);
+      float D = mesh.getSize().y;
+      float g = 0.0001f;
+      for (float U : U_list) {
+        std::string sub_out = out_dir + "/vel_" + std::to_string(U);
+        SimStats stats = run_simulation(
+            nx, ny, nz, tau, U, fluid_fraction, capsule_x_ratio, capsule_depth_ratio,
+            -1.0f, sub_out, steps, output_every, stl_path, spacing_req, mdf_iter, beta,
+            angle, scale, false);
+        float Fr = U / sqrt(g * D);
+        sum_csv << U << "," << Fr << "," << stats.max_amp << "," << stats.avg_corr
+                << "\n";
+      }
+      std::cout << "Velocity scan complete. Saved to summary_velocity.csv\n";
+    } else {
+      run_simulation(nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio,
+                     capsule_depth_ratio, -1.0f, out_dir, steps, output_every,
+                     stl_path, spacing_req, mdf_iter, beta, angle, scale, true);
+    }
   }
 
   return 0;
