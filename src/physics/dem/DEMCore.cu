@@ -1143,12 +1143,13 @@ void DEMCore::gatherDiagnostics() {
 
     // Warnings
     float warn_threshold = cfg_.max_overlap_warn * cfg_.particle_radius;
-    if (h_max_overlap > warn_threshold) {
-        fprintf(stderr,
-                "[DEM WARNING] Step %llu: max overlap %.4e > %.1f%% of R (%.4e)\n",
-                step_count_, h_max_overlap,
-                cfg_.max_overlap_warn * 100.0f, warn_threshold);
-    }
+    // Overlap warning log disabled (too noisy for long runs).
+    // if (h_max_overlap > warn_threshold) {
+    //     fprintf(stderr,
+    //             "[DEM WARNING] Step %llu: max overlap %.4e > %.1f%% of R (%.4e)\n",
+    //             step_count_, h_max_overlap,
+    //             cfg_.max_overlap_warn * 100.0f, warn_threshold);
+    // }
 }
 
 bool DEMCore::checkHealth() const {

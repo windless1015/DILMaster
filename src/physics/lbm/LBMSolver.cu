@@ -91,9 +91,10 @@ void LBMSolver::step(StepContext &ctx) {
 
   core_->streamCollide();
 
-  if (ctx.step % 100 == 0) {
-      printf("[LBMSolver::step] core=%p u_aos=%p\n", core_.get(), core_->velocityAoSPtr());
-  }
+  // Verbose per-step debug log disabled to avoid console flooding.
+  // if (ctx.step % 100 == 0) {
+  //     printf("[LBMSolver::step] core=%p u_aos=%p\n", core_.get(), core_->velocityAoSPtr());
+  // }
 
   for (auto &module : modules_) {
     module->postStream(ctx);

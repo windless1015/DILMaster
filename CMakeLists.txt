@@ -72,6 +72,7 @@ target_link_libraries(physics PUBLIC
 
 set_target_properties(physics PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 
 # ------------------------------------------------------------------------------
@@ -97,4 +98,5 @@ if(BUILD_APPS)
   add_subdirectory(lbm_test)
   add_subdirectory(ib_test)
   add_subdirectory(dem_test)
+  add_subdirectory(validation_tests)
 endif()
