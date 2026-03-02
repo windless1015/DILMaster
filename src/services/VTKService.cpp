@@ -63,6 +63,7 @@ void VTKService::writeVTIFile(const StepContext &ctx) {
   struct FieldInfo {
       std::string name;
       std::string vtk_name; // e.g. "Velocity"
+      std::string vtk_type;
       int components;
       size_t data_size;
   };
@@ -73,14 +74,24 @@ void VTKService::writeVTIFile(const StepContext &ctx) {
       if(ctx.fields->exists(name)) {
           auto h = ctx.fields->get(name);
           size_t comps = 1;
-          if(h.element_size() == 12) comps = 3; // float3 = 12 bytes
-          active_fields.push_back({name, name, (int)comps, h.size_bytes()});
+          std::string vtk_type = "Float32"; // default
+          if(h.element_size() == 1) {
+              vtk_type = "UInt8";
+          } else if(h.element_size() == 4) {
+              vtk_type = "Float32";
+          } else if(h.element_size() == 8) {
+              vtk_type = "Float64";
+          } else if(h.element_size() == 12) {
+              comps = 3; // float3 = 12 bytes
+              vtk_type = "Float32";
+          }
+          active_fields.push_back({name, name, vtk_type, (int)comps, h.size_bytes()});
       }
   }
 
   // XML Declaration
   for(const auto& f : active_fields) {
-      file << "        <DataArray type=\"Float32\" Name=\"" << f.vtk_name 
+      file << "        <DataArray type=\"" << f.vtk_type << "\" Name=\"" << f.vtk_name 
            << "\" NumberOfComponents=\"" << f.components << "\" format=\"" 
            << (config_.binary ? "appended" : "ascii") << "\"";
       if(config_.binary) {
