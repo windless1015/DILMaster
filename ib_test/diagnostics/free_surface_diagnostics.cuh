@@ -252,11 +252,11 @@ public:
     // 5. Save outputs
     if (save_vtk || save_csv) {
       std::stringstream ss;
-      ss << std::setw(4) << std::setfill('0') << step;
+      ss << std::setw(6) << std::setfill('0') << step;
       std::string step_str = ss.str();
 
       if (save_csv) {
-        std::ofstream ofs(out_dir + "/free_surface_eta_step" + step_str +
+        std::ofstream ofs(out_dir + "/free_surface_eta_step_" + step_str +
                           ".csv");
         ofs << "x,y,eta\n";
         for (int y = 0; y < ny; ++y) {
@@ -266,9 +266,9 @@ public:
         }
       }
       if (save_vtk) {
-        writeVTI(out_dir + "/free_surface_eta_step" + step_str + ".vti", nx, ny,
+        writeVTI(out_dir + "/free_surface_eta_step_" + step_str + ".vti", nx, ny,
                  h_eta, "eta");
-        writeVTI(debug_dir + "/free_surface_pressure_step" + step_str + ".vti",
+        writeVTI(debug_dir + "/free_surface_pressure_step_" + step_str + ".vti",
                  nx, ny, h_p, "p_sub");
       }
     }

@@ -1,6 +1,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -409,28 +411,7 @@ std::vector<float> parseList(std::string str) {
   return res;
 }
 
-int main(int argc, char **argv) {
-  std::cout << "--- FreeSurface Validation Enabled ---" << std::endl;
-  std::cout << "Expect drawdown over body if negative pressure region exists."
-            << std::endl;
-
-  // Defaults
-  std::string stl_path = "../../tools/capsule.stl";
-  int nx = 512, ny = 128, nz = 128; // Increased Z for depth
-  float tau = 0.8f;
-  float U0 = 0.08f;
-  float spacing_req = 1.0f;
-  int mdf_iter = 5;
-  float beta = -0.5f;
-  float angle = 0.0f;
-  float scale = 1.0f;
-  int steps = 5000;
-  int output_every = 100;
-  std::string out_dir = "out/capsule_fs";
-  float fluid_fraction = 0.7f;
-  float capsule_x_ratio = 0.15f;
-  float capsule_depth_ratio = 0.5f;
-
+void runLegacyBatchScans(int argc, char **argv, int nx, int ny, int nz, float tau, float U0, float spacing_req, int mdf_iter, float beta, float angle, float scale, int steps, int output_every, std::string stl_path, std::string out_dir, float fluid_fraction, float capsule_x_ratio, float capsule_depth_ratio) {
   // Loop lists
   std::string depth_list_str = "";
   std::string U_list_str = "";
@@ -438,9 +419,7 @@ int main(int argc, char **argv) {
   // Args Parsing
   if (argc <= 1) {
     // VS Default Mode: Activate Scans
-    std::cout
-        << "\n[VS Mode] No arguments detected. Running automated diagnostics "
-           "scans...\n";
+    std::cout << "\n[VS Mode] No arguments detected. Running automated diagnostics scans...\n";
 
     // 1. Depth Scan
     std::vector<float> depth_list = {1.5f, 2.0f, 3.0f, 4.0f, 5.0f};
@@ -481,13 +460,12 @@ int main(int argc, char **argv) {
           spacing_req, mdf_iter, beta, angle, scale, false);
 
       float Fr = U / sqrt(g * D);
-      sum_v_csv << U << "," << Fr << "," << stats.max_amp << ","
-                << stats.avg_corr << "\n";
+      sum_v_csv << U << "," << Fr << "," << stats.max_amp << "," << stats.avg_corr << "\n";
       sum_v_csv.flush();
     }
     std::cout << "Velocity scan complete used default list.\n";
 
-    return 0;
+    return;
   }
 
   for (int i = 1; i < argc; ++i) {
@@ -512,7 +490,6 @@ int main(int argc, char **argv) {
       steps = std::stoi(argv[++i]);
     else if (arg == "--outDir")
       out_dir = argv[++i];
-    // ... (other args support)
   }
 
   if (!depth_list_str.empty()) {
@@ -537,10 +514,9 @@ int main(int argc, char **argv) {
     std::ofstream sum_csv("summary_velocity.csv");
     sum_csv << "U,Fr,A_max,Corr\n";
 
-    // Need Length for Fr. Load STL to get D? Or reuse D.
     STLMesh mesh;
     STLReader::readSTL(stl_path, mesh);
-    float D = mesh.getSize().y; // Assuming Y is D as per prior code
+    float D = mesh.getSize().y; 
     float g = 0.0001f;
 
     for (float U : list) {
@@ -552,17 +528,109 @@ int main(int argc, char **argv) {
           spacing_req, mdf_iter, beta, angle, scale, false);
 
       float Fr = U / sqrt(g * D);
-      sum_csv << U << "," << Fr << "," << stats.max_amp << "," << stats.avg_corr
-              << "\n";
+      sum_csv << U << "," << Fr << "," << stats.max_amp << "," << stats.avg_corr << "\n";
       sum_csv.flush();
     }
     std::cout << "Velocity scan complete. Saved to summary_velocity.csv\n";
-  } else {
-    // Single Run
-    run_simulation(nx, ny, nz, tau, U0, fluid_fraction, capsule_x_ratio,
-                   capsule_depth_ratio, -1.0f, out_dir, steps, output_every,
-                   stl_path, spacing_req, mdf_iter, beta, angle, scale, true);
   }
+}
+
+int main(int argc, char **argv) {
+  std::cout << "--- FreeSurface Validation Enabled ---" << std::endl;
+  std::cout << "Expect drawdown over body if negative pressure region exists."
+            << std::endl;
+
+  // Defaults
+  std::string stl_path = "../../tools/capsule.stl";
+  int nx = 512, ny = 128, nz = 128; // Increased Z for depth
+  float tau = 0.8f;
+  float U0 = 0.08f;
+  float spacing_req = 1.0f;
+  int mdf_iter = 5;
+  float beta = -0.5f;
+  float angle = 0.0f;
+  float scale = 1.0f;
+  int steps = 5000;
+  int output_every = 100;
+  std::string out_dir = "out/capsule_fs";
+  float fluid_fraction = 0.7f;
+  float capsule_x_ratio = 0.15f;
+  float capsule_depth_ratio = 0.5f;
+
+  // =========================================================================
+  // Interactive User Interface
+  // =========================================================================
+  float user_depth_R = 1.5f;
+  float user_U0 = U0;
+  std::string user_out_dir = out_dir;
+
+  std::cout << "\n======================================================\n";
+  std::cout << "      Capsule Free-Surface Interactive Setup            \n";
+  std::cout << "======================================================\n";
+  
+  std::cout << "Enter the depth ratio of the capsule to the liquid surface (h/R), suggested range [1.0 ~ 5.0] (default " << user_depth_R << "): ";
+  std::string input;
+  std::getline(std::cin, input);
+  if (!input.empty()) {
+      try { user_depth_R = std::stof(input); } catch (...) {}
+  }
+  
+  std::cout << "Enter the lattice velocity of the capsule (U0), suggested range [0.04 ~ 0.10] (default " << user_U0 << "): ";
+  std::getline(std::cin, input);
+  if (!input.empty()) {
+      try { user_U0 = std::stof(input); } catch (...) {}
+  }
+  
+  std::cout << "Enter the output directory base path (e.g. out/test_case) (default " << user_out_dir << "): ";
+  std::getline(std::cin, input);
+  if (!input.empty()) {
+      user_out_dir = input;
+  }
+  
+  std::cout << "Enter the total number of simulation steps (default 8000): ";
+  int user_steps = 8000;
+  std::getline(std::cin, input);
+  if (!input.empty()) {
+      try { user_steps = std::stoi(input); } catch (...) {}
+  }
+  
+  // Create Timestamp string
+  auto now = std::chrono::system_clock::now();
+  auto in_time_t = std::chrono::system_clock::to_time_t(now);
+  std::stringstream ss;
+  ss << std::put_time(std::localtime(&in_time_t), "%Y%m%d_%H%M%S");
+  
+  // Format the sub-folder name
+  std::stringstream fdr;
+  fdr << user_out_dir << "/depth" << user_depth_R 
+      << "_vol" << user_U0 << "_" << ss.str();
+  user_out_dir = fdr.str();
+  
+  while (true) {
+      try {
+          fs::create_directories(user_out_dir);
+          if (fs::exists(user_out_dir) && fs::is_directory(user_out_dir)) {
+              std::cout << "Output directory created: " << user_out_dir << "\n";
+              break;
+          } else {
+              std::cout << "Failed to create directory. Path: " << user_out_dir << "\n";
+              break; // break to avoid infinite loop on permission issue
+          }
+      } catch (const std::exception& e) {
+          std::cout << "Error creating directory: " << e.what() << "\n";
+          break;
+      }
+  }
+  
+  std::cout << "\n[Starting Simulation]\n"
+            << "  · Depth (h/R) = " << user_depth_R << "\n"
+            << "  · Velocity (U0) = " << user_U0 << "\n"
+            << "  · Steps = " << user_steps << "\n"
+            << "  · Output Dir = " << user_out_dir << "\n\n";
+
+  run_simulation(nx, ny, nz, tau, user_U0, fluid_fraction, capsule_x_ratio,
+                 capsule_depth_ratio, user_depth_R, user_out_dir, user_steps, output_every,
+                 stl_path, spacing_req, mdf_iter, beta, angle, scale, true);
 
   return 0;
 }
