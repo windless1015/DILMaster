@@ -21,25 +21,26 @@
 
 #include "../../src/core/StepContext.hpp"
 #include "../../src/core/FieldStore.hpp"
+#include "../../src/core/ArrayLayoutConverter.hpp"
 #include "../../src/physics/dem/DEMCore.hpp" // Added
 #include "../../src/physics/ibm/IBMCore.hpp" // Added
 #include "IBMDEMCollisionScenario.hpp"
 #include "IBMToDEMStrategy.hpp"
 
-// Simple VTK Writer for Points & Propeller Markers
 void writeVTK(int step, StepContext& ctx) {
     std::filesystem::create_directories("ibm_dem_collision/vtk");
-    std::string filename = "ibm_dem_collision/vtk/step_" + std::to_string(step) + ".vtp";
+    
+    // Zero-padded filename (e.g. step_0000.vtk) so ParaView groups them
+    char filename[256];
+    std::snprintf(filename, sizeof(filename), "ibm_dem_collision/vtk/step_%04d.vtk", step);
     std::ofstream out(filename);
 
-    // DEM
+    // DEM (Explicitly ensure host has latest from device before writing)
     auto posH = ctx.fields->get(DEMFields::POSITION);
-    auto velH = ctx.fields->get(DEMFields::VELOCITY);
     const float3* pos = posH.as<float3>();
-    const float3* vel = velH.as<float3>();
     int N_p = static_cast<int>(posH.count());
 
-    // IBM
+    // IBM (Assuming synced from IBMSolver loop)
     if (!ctx.fields->exists(IBMFields::MARKERS)) return; // Safety check
     auto markH = ctx.fields->get(IBMFields::MARKERS);
     const float3* markers = markH.as<float3>();
@@ -47,32 +48,33 @@ void writeVTK(int step, StepContext& ctx) {
 
     int N_total = N_p + N_m;
 
-    out << "<?xml version=\"1.0\"?>\n";
-    out << "<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\">\n";
-    out << "  <PolyData>\n";
-    out << "    <Piece NumberOfPoints=\"" << N_total << "\" NumberOfVerts=\"" << N_total << "\">\n";
+    // Legacy VTK format
+    out << "# vtk DataFile Version 3.0\n";
+    out << "IBM-DEM Collision State\n";
+    out << "ASCII\n";
+    out << "DATASET POLYDATA\n";
     
-    // Points
-    out << "      <Points>\n";
-    out << "        <DataArray type=\"Float32\" NumberOfComponents=\"3\" format=\"ascii\">\n";
+    // 1. Points
+    out << "POINTS " << N_total << " float\n";
     // Particle
-    for(int i=0; i<N_p; ++i) out << pos[i].x << " " << pos[i].y << " " << pos[i].z << " ";
+    for(int i=0; i<N_p; ++i) out << pos[i].x << " " << pos[i].y << " " << pos[i].z << "\n";
     // Propeller
-    for(int i=0; i<N_m; ++i) out << markers[i].x << " " << markers[i].y << " " << markers[i].z << " ";
-    out << "\n        </DataArray>\n";
-    out << "      </Points>\n";
+    for(int i=0; i<N_m; ++i) out << markers[i].x << " " << markers[i].y << " " << markers[i].z << "\n";
 
-    // Data - Type (0=Particle, 1=Propeller)
-    out << "      <PointData Scalars=\"Type\">\n";
-    out << "        <DataArray type=\"Int32\" Name=\"Type\" NumberOfComponents=\"1\" format=\"ascii\">\n";
-    for(int i=0; i<N_p; ++i) out << "0 ";
-    for(int i=0; i<N_m; ++i) out << "1 ";
-    out << "\n        </DataArray>\n";
-    out << "      </PointData>\n";
+    // 2. Vertices topology (Each point needs its own cell for proper point cloud rendering)
+    out << "\nVERTICES " << N_total << " " << (2 * N_total) << "\n";
+    for(int i=0; i<N_total; ++i) {
+        out << "1 " << i << "\n";
+    }
 
-    out << "    </Piece>\n";
-    out << "  </PolyData>\n";
-    out << "</VTKFile>\n";
+    // 3. Point data (Type info to colorize)
+    out << "\nPOINT_DATA " << N_total << "\n";
+    out << "SCALARS Type int 1\n";
+    out << "LOOKUP_TABLE default\n";
+    for(int i=0; i<N_p; ++i) out << "0\n"; // 0 = Particle
+    for(int i=0; i<N_m; ++i) out << "1\n"; // 1 = Propeller
+    
+    out.close();
 }
 
 int main() {
@@ -254,6 +256,25 @@ int main() {
 
         // Output & logging
         if (step % 10 == 0) {
+            // Force download to host immediately before VTK
+            if (demSolver.getCore()) {
+                auto ph = ctx.fields->get(DEMFields::POSITION);
+                int N_p = ph.count();
+                std::vector<float> tmp(3 * N_p, 0.0f);
+                demSolver.getCore()->downloadPositions(tmp.data());
+                
+                // Convert back from SoA (XXX... YYY... ZZZ...) to AoS (XYZ XYZ XYZ)
+                auto aos_data = core::ArrayLayoutConverter::SoAToAoS_float3(tmp.data(), N_p);
+                float3* pTarget = ph.as<float3>();
+                for(int k=0; k<N_p; ++k) {
+                    pTarget[k] = aos_data[k];
+                }
+            }
+            if (ibmSolver.getCore()) {
+                 auto mh = ctx.fields->get(IBMFields::MARKERS);
+                 ibmSolver.getCore()->downloadPositions(mh.as<float3>());
+            }
+
             writeVTK(step, ctx);
             std::cout << "Step " << step
                       << " dist_min=" << step_min_dist
