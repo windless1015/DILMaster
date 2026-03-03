@@ -91,8 +91,17 @@ public:
     float3 *vel = velF.as<float3>();
     vel[0] = make_float3(0, 0, 0);
 
-    dem.getCore()->uploadPositions(reinterpret_cast<float *>(pos));
-    dem.getCore()->uploadVelocities(reinterpret_cast<float *>(vel));
+    // DEMCore requires SoA layout
+    std::vector<float3> aos_pos(1, pos[0]);
+    std::vector<float3> aos_vel(1, vel[0]);
+    std::vector<float> soa_pos(3);
+    std::vector<float> soa_vel(3);
+    
+    core::ArrayLayoutConverter::AoSToSoA_float3(aos_pos, soa_pos.data());
+    core::ArrayLayoutConverter::AoSToSoA_float3(aos_vel, soa_vel.data());
+
+    dem.getCore()->uploadPositions(soa_pos.data());
+    dem.getCore()->uploadVelocities(soa_vel.data());
   }
 
 private:

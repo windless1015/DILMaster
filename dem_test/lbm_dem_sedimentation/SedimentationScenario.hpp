@@ -6,6 +6,7 @@
 #include "../../src/physics/dem/DEMSolver.hpp"
 #include "../../src/physics/dem/DEMCore.hpp"   // Added
 #include "../../src/physics/dem/DEMConfig.hpp" // Added
+#include "../../src/core/ArrayLayoutConverter.hpp" // Added
 #include <iostream>
 
 class SedimentationScenario {
@@ -49,8 +50,12 @@ public:
         float3* pos = posF.as<float3>();
         pos[0] = make_float3(cfg_.domain_x * 0.5f, cfg_.domain_y * 0.5f, 0.08f);
         
-        // Upload initial state specifically
-        dem.getCore()->uploadPositions(static_cast<float*>(posF.data()));
+        // Upload initial state specifically using SoA layouts
+        std::vector<float3> aos_pos(1, pos[0]);
+        std::vector<float> soa_pos(3);
+        core::ArrayLayoutConverter::AoSToSoA_float3(aos_pos, soa_pos.data());
+        
+        dem.getCore()->uploadPositions(soa_pos.data());
         dem.getCore()->checkHealth();
         
         std::cout << "[Scenario] Setup Complete. Particle at (0.025, 0.025, 0.08)" << std::endl;

@@ -1,28 +1,9 @@
 #include "../../core/FieldStore.hpp"
+#include "../../core/ArrayLayoutConverter.hpp"
 #include "DEMCore.hpp"
 #include "DEMSolver.hpp"
 #include <iostream>
 #include <vector>
-
-namespace {
-std::vector<float> aosToSoA(const float3* aos, std::size_t n) {
-  std::vector<float> soa(3 * n, 0.0f);
-  for (std::size_t i = 0; i < n; ++i) {
-    soa[i] = aos[i].x;
-    soa[n + i] = aos[i].y;
-    soa[2 * n + i] = aos[i].z;
-  }
-  return soa;
-}
-
-void soaToAoS(const float* soa, float3* aos, std::size_t n) {
-  for (std::size_t i = 0; i < n; ++i) {
-    aos[i].x = soa[i];
-    aos[i].y = soa[n + i];
-    aos[i].z = soa[2 * n + i];
-  }
-}
-} // namespace
 
 DEMSolver::DEMSolver() = default;
 DEMSolver::~DEMSolver() = default;
@@ -104,8 +85,18 @@ void DEMSolver::initialize(StepContext &ctx) {
 
   // 2. Upload initial state from FieldStore to GPU
   // FieldStore stores float3 AoS, while DEMCore expects SoA [x... y... z...]
-  auto pos_soa = aosToSoA(static_cast<float3*>(posF.data()), n);
-  auto vel_soa = aosToSoA(static_cast<float3*>(velF.data()), n);
+  
+  std::vector<float3> aos_pos_tmp(n);
+  std::vector<float3> aos_vel_tmp(n);
+  float3* pRaw = static_cast<float3*>(posF.data());
+  float3* vRaw = static_cast<float3*>(velF.data());
+  for(size_t i=0; i<n; ++i) { aos_pos_tmp[i] = pRaw[i]; aos_vel_tmp[i] = vRaw[i]; }
+
+  std::vector<float> pos_soa(3 * n);
+  std::vector<float> vel_soa(3 * n);
+  core::ArrayLayoutConverter::AoSToSoA_float3(aos_pos_tmp, pos_soa.data());
+  core::ArrayLayoutConverter::AoSToSoA_float3(aos_vel_tmp, vel_soa.data());
+
   core_->uploadPositions(pos_soa.data());
   core_->uploadVelocities(vel_soa.data());
   core_->uploadRadii(h_radius);
@@ -133,7 +124,12 @@ void DEMSolver::step(StepContext &ctx) {
   
   // 1. Sync Coupling Forces: FieldStore (Host) -> DEMCore (Device)
   auto forceF = ctx.fields->get(DEMFields::FORCE);
-  auto force_soa = aosToSoA(static_cast<float3*>(forceF.data()), n);
+  std::vector<float3> aos_force_tmp(n);
+  float3* fRaw = static_cast<float3*>(forceF.data());
+  for(size_t i=0; i<n; ++i) { aos_force_tmp[i] = fRaw[i]; }
+
+  std::vector<float> force_soa(3 * n);
+  core::ArrayLayoutConverter::AoSToSoA_float3(aos_force_tmp, force_soa.data());
   
   // Inject into DEMCore (added in refactor)
   core_->uploadExternalForces(force_soa.data());
@@ -171,9 +167,19 @@ void DEMSolver::step(StepContext &ctx) {
   core_->downloadPositions(pos_soa.data());
   core_->downloadVelocities(vel_soa.data());
   core_->downloadForces(frc_soa.data());
-  soaToAoS(pos_soa.data(), static_cast<float3*>(posF.data()), n);
-  soaToAoS(vel_soa.data(), static_cast<float3*>(velF.data()), n);
-  soaToAoS(frc_soa.data(), static_cast<float3*>(forceF.data()), n);
+
+  auto aos_pos = core::ArrayLayoutConverter::SoAToAoS_float3(pos_soa.data(), n);
+  auto aos_vel = core::ArrayLayoutConverter::SoAToAoS_float3(vel_soa.data(), n);
+  auto aos_frc = core::ArrayLayoutConverter::SoAToAoS_float3(frc_soa.data(), n);
+
+  float3* pRaw = static_cast<float3*>(posF.data());
+  float3* vRaw = static_cast<float3*>(velF.data());
+  fRaw = static_cast<float3*>(forceF.data());
+  for(size_t i=0; i<n; ++i) {
+      pRaw[i] = aos_pos[i];
+      vRaw[i] = aos_vel[i];
+      fRaw[i] = aos_frc[i];
+  }
 }
 
 void DEMSolver::finalize(StepContext &ctx) {
