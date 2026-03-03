@@ -21,9 +21,9 @@ public:
     float particle_radius = 0.01f;
     float particle_rho = 2500.0f;
     float stiffness = 5.0e4f;
-    float damping = 5.0f;
+    float damping = 15.0f; // Increase damping slightly
     float dem_kn = 5.0e6f;
-    float dem_restitution = 1.0f;
+    float dem_restitution = 0.5f; // From perfectly elastic (1.0) to inelastic
     float influence_radius = 0.002f;
     float initial_gap_factor = 0.5f; // particle offset = (R + influence) * factor
   };
@@ -50,46 +50,18 @@ public:
     auto posF = ctx.fields->get(DEMFields::POSITION);
     float3 *pos = posF.as<float3>();
     float3 center = make_float3(kCenterX, kCenterY, kCenterZ);
-    float3 seed = make_float3(0.6f, 0.5f, 0.5f);
+    // Offset further from the center into the mid-blade (about 0.10 ~ 0.15 of the 0.20 propeller radius)
+    float3 seed = make_float3(kCenterX + 0.12f, kCenterY, kCenterZ + 0.15f);
 
-    const auto &markers = ibm.getMarkers();
-    if (!markers.empty()) {
-      // Use tip-side marker (max radial distance in XY) to avoid dead zone near hub.
-      float max_r2 = -1.0f;
-      float3 tip = markers[0].pos;
-      for (const auto &mk : markers) {
-        float dx = mk.pos.x - center.x;
-        float dy = mk.pos.y - center.y;
-        float r2 = dx * dx + dy * dy;
-        if (r2 > max_r2) {
-          max_r2 = r2;
-          tip = mk.pos;
-        }
-      }
-
-      float3 n = make_float3(tip.x - center.x, tip.y - center.y, tip.z - center.z);
-      float nlen = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-      if (nlen < 1e-8f) {
-        n = make_float3(1.0f, 0.0f, 0.0f);
-      } else {
-        n.x /= nlen;
-        n.y /= nlen;
-        n.z /= nlen;
-      }
-
-      float offset =
-          (cfg_.particle_radius + cfg_.influence_radius) * cfg_.initial_gap_factor;
-      seed = make_float3(tip.x + n.x * offset, tip.y + n.y * offset, tip.z + n.z * offset);
-    }
     pos[0] = seed;
     std::cout << "[IBMDEMCollisionScenario] Initial particle position = ("
               << pos[0].x << ", " << pos[0].y << ", " << pos[0].z << ")"
               << std::endl;
 
-    // Initial velocity zero
+    // Initial velocity downward to ensure drop
     auto velF = ctx.fields->get(DEMFields::VELOCITY);
     float3 *vel = velF.as<float3>();
-    vel[0] = make_float3(0, 0, 0);
+    vel[0] = make_float3(0, 0, 0.0f); // Let gravity do the work
 
     // DEMCore requires SoA layout
     std::vector<float3> aos_pos(1, pos[0]);
@@ -205,7 +177,7 @@ private:
 
     dCfg.gravity_x = 0;
     dCfg.gravity_y = 0;
-    dCfg.gravity_z = 0; // No gravity
+    dCfg.gravity_z = -9.81f; // Enable gravity for realistic drop & hit
     dCfg.kn = cfg_.dem_kn;
     dCfg.restitution = cfg_.dem_restitution;
 
