@@ -46,7 +46,8 @@ Step 100 T=0.5 Vz=-0.701363 Re=7013.63 Cd_ref=0.39869 Cd_term=0.398853
 #include "../../src/core/StepContext.hpp"
 #include "../../src/core/FieldStore.hpp"
 #include "SedimentationScenario.hpp"
-#include "LBMToDEM_UnresolvedStrategy.hpp"
+#include "../../src/coupling/LBMToDEM_UnresolvedStrategy.hpp"
+using coupling::LBMToDEM_UnresolvedStrategy;
 
 // VTK Output Helper
 void writeVTK(int step, StepContext& ctx) {

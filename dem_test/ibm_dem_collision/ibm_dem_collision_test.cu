@@ -25,7 +25,8 @@
 #include "../../src/physics/dem/DEMCore.hpp" // Added
 #include "../../src/physics/ibm/IBMCore.hpp" // Added
 #include "IBMDEMCollisionScenario.hpp"
-#include "IBMToDEMStrategy.hpp"
+#include "../../src/coupling/IBMToDEMStrategy.hpp"
+using coupling::IBMToDEMStrategy;
 
 void writeVTK(int step, StepContext& ctx) {
     std::filesystem::create_directories("ibm_dem_collision/vtk");
