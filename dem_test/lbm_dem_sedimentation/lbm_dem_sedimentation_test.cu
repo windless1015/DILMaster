@@ -43,11 +43,10 @@ Step 100 T=0.5 Vz=-0.701363 Re=7013.63 Cd_ref=0.39869 Cd_term=0.398853
 #include <cmath>
 #include <filesystem>
 
-#include "../../src/core/StepContext.hpp"
-#include "../../src/core/FieldStore.hpp"
+#include "core/StepContext.hpp"
+#include "core/FieldStore.hpp"
 #include "SedimentationScenario.hpp"
-#include "../../src/coupling/LBMToDEM_UnresolvedStrategy.hpp"
-using coupling::LBMToDEM_UnresolvedStrategy;
+#include "coupling/LBMToDEM_UnresolvedStrategy.hpp"
 
 // VTK Output Helper
 void writeVTK(int step, StepContext& ctx) {
@@ -108,11 +107,11 @@ int main() {
     scenario.setup(lbmSolver, demSolver, ctx);
     
     // 3. Coupler
-    LBMToDEM_UnresolvedStrategy::Params cParams;
+    coupling::LBMToDEM_UnresolvedStrategy::Params cParams;
     cParams.rho_f = cfg.fluid_rho;
     cParams.nu = cfg.fluid_nu;
     cParams.g = make_float3(0,0, cfg.g_z);
-    LBMToDEM_UnresolvedStrategy coupler(cParams);
+    coupling::LBMToDEM_UnresolvedStrategy coupler(cParams);
     
     // 4. Loop
     std::ofstream csv("lbm_dem_sedimentation/sedimentation_data.csv");

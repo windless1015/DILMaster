@@ -235,15 +235,22 @@ int main(int argc, char** argv) {
     vtk_cfg.interval = output_every;
     vtk_cfg.binary = true; // Use Binary
     vtk_cfg.binary = true; // Use Binary
-    // === 修复3: 教科书级字段命名与注释 ===
+    // === 教科书级字段命名与注释 ===
+    // 同时输出实验室坐标系（Lab）和球体坐标系（Rel）的场
     vtk_cfg.fields = { 
         "Density", 
-        "Pressure",  // 已无量纲化: 色阶[-0.5, 1.0]显示驻点/尾流
-        "Speed", 
-        "Velocity", 
+        "Pressure",      // 已无量纲化: 色阶[-0.5, 1.0]显示驻点/尾流
+        "Speed",         // Lab frame: |u|
+        "Velocity",      // Lab frame: u
+        "RelSpeed",      // Sphere frame: |u - U_sphere| (教科书视角)
+        "RelVelocity",   // Sphere frame: u - U_sphere  (教科书视角)
         "Force", 
-        "Vorticity"  // 涡量幅值: 用阈值>0.1显示分离点(80°)和尾涡
+        "Vorticity"      // 涡量幅值: 用阈值>0.1显示分离点(80°)和尾涡
     };
+    // Paraview操作指南:
+    // 1. RelSpeed: 色阶[0, U0*1.5] → 驻点=0(蓝), 远场=U0(绿), 赤道加速=1.5U0(红)
+    // 2. Pressure: 色阶[-0.5, 1.0] → 驻点+1.0(红) → 尾流-0.4(蓝)
+    // 3. Vorticity: 阈值>0.005显示分离点和尾涡结构
     // Paraview操作指南:
     // 1. Pressure: 色阶设为[-0.5, 1.0] → 红色(驻点+1.0)→蓝色(尾流-0.4)
     // 2. Vorticity: 阈值>0.1显示分离点
@@ -422,38 +429,66 @@ int main(int argc, char** argv) {
                 auto h_om = fields.create({ "Vorticity", (size_t)nx * ny * nz, sizeof(float) * 3 });
                 CHECK_CUDA(cudaMemcpy(h_om.data(), d_omega, nx * ny * nz * sizeof(float3), cudaMemcpyDeviceToHost));
 
+                // --- Lab-frame Velocity (原始速度) ---
                 auto h_u = fields.create({ "Velocity", (size_t)nx * ny * nz, sizeof(float) * 3 });
                 CHECK_CUDA(cudaMemcpy(h_u.data(), u_aos, nx * ny * nz * sizeof(float3), cudaMemcpyDeviceToHost));
+                float3* cpu_u_ptr = (float3*)h_u.data();
 
-                // === 阶段4: 速度剖面诊断（验证边界层）===
-                // 沿球体中心线 (y=ny/2, z=nz/2) 提取x方向速度
+                // --- Sphere-frame Relative Velocity: u_rel = u - U_sphere (教科书视角) ---
+                // 在球体坐标系中：
+                //   远场: u_rel = -U_sphere (来流)
+                //   球面: u_rel = 0 (无滑移)
+                //   驻点前方: 流体减速 → |u_rel| < U0
+                //   赤道两侧: 流体加速 → |u_rel| > U0
+                //   尾流区: 低速回流区
+                std::vector<float3> rel_vel(nx * ny * nz);
+                for (int i = 0; i < nx * ny * nz; ++i) {
+                    rel_vel[i].x = cpu_u_ptr[i].x - U_obj.x;
+                    rel_vel[i].y = cpu_u_ptr[i].y - U_obj.y;
+                    rel_vel[i].z = cpu_u_ptr[i].z - U_obj.z;
+                }
+                auto h_rel_u = fields.create({ "RelVelocity", (size_t)nx * ny * nz, sizeof(float) * 3 });
+                memcpy(h_rel_u.data(), rel_vel.data(), nx * ny * nz * sizeof(float3));
+
+                // --- Lab-frame Speed: |u| ---
+                std::vector<float> speed(nx * ny * nz);
+                for (int i = 0; i < nx * ny * nz; ++i)
+                    speed[i] = sqrtf(cpu_u_ptr[i].x * cpu_u_ptr[i].x + cpu_u_ptr[i].y * cpu_u_ptr[i].y + cpu_u_ptr[i].z * cpu_u_ptr[i].z);
+                auto h_speed = fields.create({ "Speed", (size_t)nx * ny * nz, sizeof(float) });
+                memcpy(h_speed.data(), speed.data(), speed.size() * sizeof(float));
+
+                // --- Sphere-frame Relative Speed: |u - U_sphere| (教科书视角) ---
+                // Paraview 推荐色阶: [0, U0*1.5]
+                //   蓝色(0)   = 驻点（球面无滑移）
+                //   绿色(U0)  = 远场来流
+                //   红色(>U0) = 赤道加速区（Bernoulli效应）
+                std::vector<float> rel_speed(nx * ny * nz);
+                for (int i = 0; i < nx * ny * nz; ++i)
+                    rel_speed[i] = sqrtf(rel_vel[i].x * rel_vel[i].x + rel_vel[i].y * rel_vel[i].y + rel_vel[i].z * rel_vel[i].z);
+                auto h_rel_speed = fields.create({ "RelSpeed", (size_t)nx * ny * nz, sizeof(float) });
+                memcpy(h_rel_speed.data(), rel_speed.data(), rel_speed.size() * sizeof(float));
+
+                // === 速度剖面诊断（球体坐标系，验证边界层）===
+                // 沿球体中心线 (y=ny/2, z=nz/2) 提取x方向相对速度
                 if (t % output_every == 0 && moving) {
                     std::vector<float> ux_profile(nx);
-                    float3* cpu_u = (float3*)h_u.data();  // 已下载的velocity
                     int y_mid = ny / 2;
                     int z_mid = nz / 2;
                     for (int x = 0; x < nx; ++x) {
                         int idx = z_mid * nx * ny + y_mid * nx + x;
-                        ux_profile[x] = cpu_u[idx].x / U0;  // 无量纲化 Ux/U0
+                        // 球体坐标系: (u - U_sphere) / U0
+                        // 理想值: 远场 → -1.0, 驻点 → 0.0
+                        ux_profile[x] = (cpu_u_ptr[idx].x - U_obj.x) / (U0 + 1e-10f);
                     }
-                    // 保存剖面到CSV（教科书级验证数据）
                     std::ofstream prof(out_dir + "/ux_profile_t" + std::to_string(t) + ".csv");
-                    prof << "x,Ux_U0\n";
+                    prof << "x,Ux_rel_U0\n";
                     for (int x = 0; x < nx; ++x) {
                         prof << x << "," << ux_profile[x] << "\n";
                     }
                     prof.close();
-                    
-                    // 教学注释：理想势流解 Ux/U0 = 1 - (R³/r³)cosθ
-                    // 当前剖面可用于验证IBM边界层分辨率（dx/R=0.1时边界层≈3-4格）
+                    // 教学注释: 势流理论 Ux/U0 = -1 + (R³/r³) 在前驻点线上
+                    // 边界层内 Ux/U0 从 0（球面）过渡到 -1（远场）
                 }
-
-                // Speed
-                std::vector<float> speed(nx * ny * nz);
-                float3* cpu_u_ptr = (float3*)h_u.data();
-                for (int i = 0; i < nx * ny * nz; ++i) speed[i] = sqrtf(cpu_u_ptr[i].x * cpu_u_ptr[i].x + cpu_u_ptr[i].y * cpu_u_ptr[i].y + cpu_u_ptr[i].z * cpu_u_ptr[i].z);
-                auto h_speed = fields.create({ "Speed", (size_t)nx * ny * nz, sizeof(float) });
-                memcpy(h_speed.data(), speed.data(), speed.size() * sizeof(float));
 
                 // B. Marker Fields
                 auto h_mk = fields.create({ "ibm.markers", nMarkers, sizeof(float) * 3 });

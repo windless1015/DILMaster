@@ -19,14 +19,13 @@
 #include <limits>
 #include <algorithm>
 
-#include "../../src/core/StepContext.hpp"
-#include "../../src/core/FieldStore.hpp"
-#include "../../src/core/ArrayLayoutConverter.hpp"
-#include "../../src/physics/dem/DEMCore.hpp" // Added
-#include "../../src/physics/ibm/IBMCore.hpp" // Added
+#include "core/StepContext.hpp"
+#include "core/FieldStore.hpp"
+#include "core/ArrayLayoutConverter.hpp"
+#include "physics/dem/DEMCore.hpp"
+#include "physics/ibm/IBMCore.hpp"
 #include "IBMDEMCollisionScenario.hpp"
-#include "../../src/coupling/IBMToDEMStrategy.hpp"
-using coupling::IBMToDEMStrategy;
+#include "coupling/IBMToDEMStrategy.hpp"
 
 void writeVTK(int step, StepContext& ctx) {
     std::filesystem::create_directories("ibm_dem_collision/vtk");
@@ -99,11 +98,11 @@ int main() {
     }
 
     // 2. Coupler
-    IBMToDEMStrategy::Params cParams;
+    coupling::IBMToDEMStrategy::Params cParams;
     cParams.stiffness = cfg.stiffness;
     cParams.damping = cfg.damping;
     cParams.influence_radius = cfg.influence_radius;
-    IBMToDEMStrategy coupler(cParams);
+    coupling::IBMToDEMStrategy coupler(cParams);
 
     // 3. Loop
     // 3. Loop + strict validation metrics

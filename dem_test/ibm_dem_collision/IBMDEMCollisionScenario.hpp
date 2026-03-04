@@ -1,11 +1,11 @@
 #pragma once
-#include "../../src/core/FieldStore.hpp"
-#include "../../src/core/StepContext.hpp"
-#include "../../src/physics/dem/DEMConfig.hpp"
-#include "../../src/physics/dem/DEMCore.hpp" // Added for getCore()
-#include "../../src/physics/dem/DEMSolver.hpp"
-#include "../../src/physics/ibm/IBMCore.hpp" // Added for getCore()
-#include "../../src/physics/ibm/IBMSolver.hpp"
+#include "core/FieldStore.hpp"
+#include "core/StepContext.hpp"
+#include "physics/dem/DEMConfig.hpp"
+#include "physics/dem/DEMCore.hpp"
+#include "physics/dem/DEMSolver.hpp"
+#include "physics/ibm/IBMCore.hpp"
+#include "physics/ibm/IBMSolver.hpp"
 #include <algorithm>
 #include <cmath>
 #include <filesystem>

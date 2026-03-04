@@ -1,12 +1,12 @@
 #pragma once
 
-#include "../../src/core/StepContext.hpp"
-#include "../../src/core/FieldStore.hpp"
-#include "../../src/physics/lbm/LBMSolver.hpp"
-#include "../../src/physics/dem/DEMSolver.hpp"
-#include "../../src/physics/dem/DEMCore.hpp"   // Added
-#include "../../src/physics/dem/DEMConfig.hpp" // Added
-#include "../../src/core/ArrayLayoutConverter.hpp" // Added
+#include "core/StepContext.hpp"
+#include "core/FieldStore.hpp"
+#include "physics/lbm/LBMSolver.hpp"
+#include "physics/dem/DEMSolver.hpp"
+#include "physics/dem/DEMCore.hpp"
+#include "physics/dem/DEMConfig.hpp"
+#include "core/ArrayLayoutConverter.hpp"
 #include <iostream>
 
 class SedimentationScenario {
