@@ -76,17 +76,17 @@ target_include_directories(ibm_poiseuille3d PRIVATE
 )
 target_compile_definitions(ibm_poiseuille3d PRIVATE IBM_TESTING)
 
-# Sphere Drag 3D
-add_executable(ibm_sphere_drag3d ibm_sphere_drag3d.cu)
-set_target_properties(ibm_sphere_drag3d PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
-target_link_libraries(ibm_sphere_drag3d PRIVATE physics ${CUDA_LIBRARIES})
-target_include_directories(ibm_sphere_drag3d PRIVATE 
+# Flow Past Fixed Sphere (Body-Force Driven)
+add_executable(ibm_flow_past_fixed_sphere ibm_flow_past_fixed_sphere.cu)
+set_target_properties(ibm_flow_past_fixed_sphere PROPERTIES CUDA_SEPARABLE_COMPILATION ON CXX_STANDARD 17)
+target_link_libraries(ibm_flow_past_fixed_sphere PRIVATE physics ${CUDA_LIBRARIES})
+target_include_directories(ibm_flow_past_fixed_sphere PRIVATE 
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/physics
     ${CMAKE_SOURCE_DIR}/src/physics/lbm
     ${CMAKE_SOURCE_DIR}/src/physics/lbm/cuda
 )
-target_compile_definitions(ibm_sphere_drag3d PRIVATE IBM_TESTING)
+target_compile_definitions(ibm_flow_past_fixed_sphere PRIVATE IBM_TESTING)
 
 # Sphere Translate 3D
 add_executable(ibm_sphere_translate3d 

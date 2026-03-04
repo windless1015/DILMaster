@@ -370,7 +370,7 @@ void run_simulation(double spacing, int steps, bool mean_flow_removal, const std
 
 int main(int argc, char** argv) {
     // Parse Args
-    std::string out_dir = "out/sphere_drag3d";
+    std::string out_dir = "out/flow_past_fixed_sphere";
     bool sweep = false;
     double spacing = 1.0;
     int steps = 200000; // Increased default to 200k for convergence
