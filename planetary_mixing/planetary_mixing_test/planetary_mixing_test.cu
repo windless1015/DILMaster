@@ -18,7 +18,10 @@
 #include <sstream>
 
 #include "physics/lbm/LBMCore.hpp"
+#include "physics/lbm/FreeSurfaceModule.hpp"
 #include "physics/ibm/IBMCore.hpp"
+#include "geometry/STLGeometryLoader.hpp"
+#include "geometry/IBMMarker.h"
 #include "services/VTKService.hpp"
 #include "core/FieldStore.hpp"
 #include "core/StepContext.hpp"
@@ -263,8 +266,8 @@ int main(int argc, char** argv) {
     float fluid_fraction = 0.7f;
     float tau = 0.8f;
     float gravity_y = -1e-5f;
-    int steps = 5000;
-    int output_every = 200;
+    int steps = -1;  // will be set interactively if not given via CLI
+    int output_every = 500;
     std::string out_dir = "output/planetary_mixing";
 
     // Physical -> lattice scale: 1 LU = 1mm
@@ -280,6 +283,42 @@ int main(int argc, char** argv) {
         if (arg == "--output" && i + 1 < argc) out_dir = argv[++i];
         if (arg == "--tau" && i + 1 < argc) tau = std::stof(argv[++i]);
         if (arg == "--scale" && i + 1 < argc) phys_to_lattice = std::stof(argv[++i]);
+    }
+
+    // Interactive step count input (if not set via --steps)
+    if (steps < 0) {
+        const int MIN_STEPS = 10000;
+        const int MAX_STEPS = 100000;
+        while (true) {
+            std::cout << "========================================" << std::endl;
+            std::cout << "Enter number of simulation steps" << std::endl;
+            std::cout << "  Range: " << MIN_STEPS << " - " << MAX_STEPS << std::endl;
+            std::cout << "  (1 revolution at 30 RPM = ~20000 steps)" << std::endl;
+            std::cout << ">> ";
+
+            std::string input;
+            std::getline(std::cin, input);
+
+            try {
+                int val = std::stoi(input);
+                if (val < MIN_STEPS) {
+                    std::cout << "ERROR: " << val << " is below minimum (" << MIN_STEPS << "). Try again." << std::endl;
+                } else if (val > MAX_STEPS) {
+                    std::cout << "ERROR: " << val << " exceeds maximum (" << MAX_STEPS << "). Try again." << std::endl;
+                } else {
+                    steps = val;
+                    std::cout << "OK: " << steps << " steps selected ("
+                              << std::fixed << std::setprecision(2)
+                              << (steps * 1e-4) << " seconds, "
+                              << (steps * 1e-4 / 2.0) << " revolutions at 30 RPM)"
+                              << std::endl;
+                    break;
+                }
+            } catch (...) {
+                std::cout << "ERROR: Invalid input '" << input << "'. Please enter a number." << std::endl;
+            }
+        }
+        std::cout << "========================================" << std::endl;
     }
 
     fs::create_directories(out_dir);
@@ -391,14 +430,102 @@ int main(int argc, char** argv) {
     lbm.initialize();
 
     int N = nx * ny * nz;
-    CHECK_CUDA(cudaMemcpy(lbm.flagsDevicePtr(), cyl.flags.data(),
-                          N * sizeof(uint8_t), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(lbm.phiDevicePtr(), cyl.phi.data(),
-                          N * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(lbm.massDevicePtr(), cyl.mass.data(),
-                          N * sizeof(float), cudaMemcpyHostToDevice));
+
+    // ---- 5. Free Surface Module ----
+    lbm::FreeSurfaceModule fsModule;
+    fsModule.configure(lbm_cfg);
+
+    FieldStore fsFields;
+    fsFields.create(FieldDesc{"fluid.density", (size_t)N, sizeof(float), lbm.densityDevicePtr()});
+    fsFields.create(FieldDesc{"fluid.velocity", (size_t)N * 3, sizeof(float), lbm.velocityDevicePtr()});
+    fsFields.create(FieldDesc{"fluid.flags", (size_t)N, sizeof(uint8_t), lbm.flagsDevicePtr()});
+    fsFields.create(FieldDesc{"fluid.phi", (size_t)N, sizeof(float), lbm.phiDevicePtr()});
+    fsFields.create(FieldDesc{"fluid.mass", (size_t)N, sizeof(float), lbm.massDevicePtr()});
+    fsModule.allocate(fsFields);
+    fsModule.initialize(fsFields);
+
+    // Set cylinder domain: outside = SOLID, inside bottom = LIQUID, top = GAS
+    // First: everything GAS
+    fsModule.setRegion(0, nx-1, 0, ny-1, 0, nz-1, lbm::CellType::GAS, 0.0f, 1.0f);
+
+    // Inside cylinder: LIQUID up to fluid_height, GAS above
+    // We do this by setting LIQUID for the full box then letting SOLID override
+    fsModule.setRegion(0, nx-1, 0, fluid_height-1, 0, nz-1, lbm::CellType::LIQUID, 1.0f, 1.0f);
+
+    // Now apply cylinder mask: set cells outside cylinder radius to SOLID
+    {
+        std::vector<uint8_t> h_flags(N);
+        CHECK_CUDA(cudaMemcpy(h_flags.data(), lbm.flagsDevicePtr(), N * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+
+        float R2 = cylinder_radius * cylinder_radius;
+        float ccx = nx / 2.0f;
+        float ccz = nz / 2.0f;
+
+        for (int z = 0; z < nz; ++z)
+            for (int y = 0; y < ny; ++y)
+                for (int x = 0; x < nx; ++x) {
+                    float dx = (float)x - ccx;
+                    float dz = (float)z - ccz;
+                    if (dx*dx + dz*dz > R2) {
+                        int idx = z * nx * ny + y * nx + x;
+                        h_flags[idx] = lbm::cuda::CellFlag::SOLID;
+                    }
+                }
+
+        CHECK_CUDA(cudaMemcpy(lbm.flagsDevicePtr(), h_flags.data(), N * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    }
+
+    fsModule.fixInterfaceLayer();
     lbm.refreshDistributions();
-    std::cout << "[LBM] Initialized, cylinder domain uploaded" << std::endl;
+    std::cout << "[FreeSurface] Initialized: LIQUID y<" << fluid_height
+              << ", GAS above, SOLID outside R=" << cylinder_radius << std::endl;
+
+    // ---- 6. IBM Setup ----
+    // Sample markers from BOTH paddle STL meshes (in physical coords, centered at origin)
+    float ibm_spacing = 1.0f;  // marker spacing in lattice units
+    float phys_spacing = ibm_spacing / phys_to_lattice;  // spacing in physical units
+    float3 zero_com = make_float3(0, 0, 0);
+
+    std::vector<IBMMarker> near_markers_ref, far_markers_ref;
+    size_t nNearMarkers = 0, nFarMarkers = 0, nTotalMarkers = 0;
+
+    if (paddle_loaded) {
+        near_markers_ref = STLGeometryLoader::sampleSurfaceMarkers(
+            paddle.nearMesh(), zero_com, phys_spacing);
+        far_markers_ref = STLGeometryLoader::sampleSurfaceMarkers(
+            paddle.farMesh(), zero_com, phys_spacing);
+        nNearMarkers = near_markers_ref.size();
+        nFarMarkers  = far_markers_ref.size();
+        nTotalMarkers = nNearMarkers + nFarMarkers;
+        std::cout << "[IBM] Markers: near=" << nNearMarkers
+                  << " far=" << nFarMarkers
+                  << " total=" << nTotalMarkers << std::endl;
+    }
+
+    ibm::IBMParams ibm_p;
+    ibm_p.nx = nx; ibm_p.ny = ny; ibm_p.nz = nz;
+    ibm_p.dx = 1.0f;
+    ibm_p.nMarkers = (int)nTotalMarkers;
+    ibm_p.mdf_iterations = 3;
+    ibm_p.mdf_beta = -0.5f;
+    ibm_p.force_method = ibm::IBMForceMethod::DIRECT_FORCING;
+    ibm::IBMCore ibm(ibm_p);
+
+    // Marker arrays (world-space positions + velocities + areas)
+    std::vector<float3> h_pos(nTotalMarkers);
+    std::vector<float3> h_vel(nTotalMarkers);
+    std::vector<float>  h_area(nTotalMarkers);
+
+    // Store relative (physical) positions for re-use each step
+    std::vector<float3> near_rel(nNearMarkers), far_rel(nFarMarkers);
+    for (size_t i = 0; i < nNearMarkers; ++i) {
+        near_rel[i] = near_markers_ref[i].pos;
+        h_area[i] = near_markers_ref[i].area * phys_to_lattice * phys_to_lattice;
+    }
+    for (size_t i = 0; i < nFarMarkers; ++i) {
+        far_rel[i] = far_markers_ref[i].pos;
+        h_area[nNearMarkers + i] = far_markers_ref[i].area * phys_to_lattice * phys_to_lattice;
+    }
 
     // Write initial paddle frame
     if (paddle_loaded) {
@@ -406,46 +533,154 @@ int main(int argc, char** argv) {
                             paddle, paddle_cfg, 0.0, paddle_center, phys_to_lattice);
     }
 
-    // ---- 4. GPU buffers ----
+    // ---- 7. GPU force buffer ----
     float3* d_force;
     CHECK_CUDA(cudaMalloc(&d_force, N * sizeof(float3)));
 
-    // ---- 5. VTK output ----
+    // ---- 8. VTK output ----
     FieldStore fields;
     StepContext ctx;
     ctx.fields = &fields;
+    ctx.backend = &lbm.backend();
 
     VTKService::Config vtk_cfg;
     vtk_cfg.output_dir = out_dir;
     vtk_cfg.nx = nx; vtk_cfg.ny = ny; vtk_cfg.nz = nz;
     vtk_cfg.interval = output_every;
     vtk_cfg.binary = true;
-    vtk_cfg.fields = {"Density", "Speed", "Velocity", "Flags"};
+    vtk_cfg.fields = {"Density", "Speed", "Velocity", "Fill"};
 
     VTKService vtk_svc(vtk_cfg);
     vtk_svc.initialize(ctx);
 
-    // ---- 6. Simulation loop ----
+    // ---- 9. Simulation loop ----
     std::cout << "Starting simulation: " << steps << " steps" << std::endl;
-    // Physical time step per LBM step
-    // RPM -> angular velocity mapping
-    // dt_phys ~ 1e-4 s/step
     double dt_phys = 1e-4;
+
+    // Rotation helpers (mirrors PlanetaryPaddleModule logic)
+    float kPi = (float)M_PI;
+    auto rpmToRad = [kPi](float rpm) { return rpm * (2.0f * kPi / 60.0f); };
+    auto degToRad = [kPi](float deg) { return deg * (kPi / 180.0f); };
+    float rev_omega       = -rpmToRad(paddle_cfg.revolution_rpm);
+    float near_spin_omega = -rpmToRad(paddle_cfg.near_spin_rpm);
+    float far_spin_omega  = -rpmToRad(paddle_cfg.far_spin_rpm);
+
+    auto rotateAxis = [](const float3& v, const float3& ax, float angle) -> float3 {
+        float c = cosf(angle), s = sinf(angle);
+        float d = ax.x * v.x + ax.y * v.y + ax.z * v.z;
+        return make_float3(
+            v.x * c + (ax.y * v.z - ax.z * v.y) * s + ax.x * d * (1 - c),
+            v.y * c + (ax.z * v.x - ax.x * v.z) * s + ax.y * d * (1 - c),
+            v.z * c + (ax.x * v.y - ax.y * v.x) * s + ax.z * d * (1 - c)
+        );
+    };
+    float3 axis = make_float3(0, 1, 0);
 
     for (int t = 0; t <= steps; ++t) {
         ctx.step = t;
         ctx.time = t;
         double time_sec = t * dt_phys;
 
-        CHECK_CUDA(cudaMemset(d_force, 0, N * sizeof(float3)));
+        // (a) Update IBM markers: rotate paddle to current angle
+        if (paddle_loaded && nTotalMarkers > 0) {
+            float rev_angle = rev_omega * (float)time_sec + degToRad(paddle_cfg.revolution_phase_deg);
+            float near_orbit_angle = rev_angle + degToRad(paddle_cfg.near_orbit_phase_deg);
+            float far_rev_angle = near_orbit_angle + kPi;
 
-        // TODO: IBM force computation (future step)
+            float near_spin_angle = near_spin_omega * (float)time_sec + degToRad(paddle_cfg.near_spin_phase_deg);
+            float far_spin_angle  = far_spin_omega * (float)time_sec + degToRad(paddle_cfg.far_spin_phase_deg);
+            near_spin_angle += near_orbit_angle;
+            far_spin_angle  += far_rev_angle;
+
+            // Near paddle center
+            float near_offset_lu = paddle_cfg.near_offset * phys_to_lattice;
+            float3 near_ofs = rotateAxis(make_float3(near_offset_lu, 0, 0), axis, near_orbit_angle);
+            float3 near_center = make_float3(paddle_center.x + near_ofs.x,
+                                              paddle_center.y + near_ofs.y,
+                                              paddle_center.z + near_ofs.z);
+
+            // Far paddle center
+            float far_offset_lu = paddle_cfg.far_offset * phys_to_lattice;
+            float3 far_ofs = rotateAxis(make_float3(far_offset_lu, 0, 0), axis, far_rev_angle);
+            float3 far_center = make_float3(paddle_center.x + far_ofs.x,
+                                             paddle_center.y + far_ofs.y,
+                                             paddle_center.z + far_ofs.z);
+
+            // Marker velocity: v = omega_revolution x r_from_center + omega_self_spin x r_from_paddle_center
+            // CRITICAL: multiply by dt_phys to convert from LU/physical_second to LU/LBM_step
+            float dt_f = (float)dt_phys;
+
+            // Update near markers
+            for (size_t i = 0; i < nNearMarkers; ++i) {
+                // Position: scale + spin rotate + translate
+                float3 v_phys = near_rel[i];
+                float3 v_lu = make_float3(v_phys.x * phys_to_lattice,
+                                           v_phys.y * phys_to_lattice,
+                                           v_phys.z * phys_to_lattice);
+                float3 v_rot = rotateAxis(v_lu, axis, near_spin_angle);
+                h_pos[i] = make_float3(near_center.x + v_rot.x,
+                                        near_center.y + v_rot.y,
+                                        near_center.z + v_rot.z);
+
+                // Velocity = revolution contribution + self-spin contribution
+                // Revolution: v_rev = omega_rev x (pos - revolution_center)
+                float3 r_rev = make_float3(h_pos[i].x - paddle_center.x, 0.0f,
+                                            h_pos[i].z - paddle_center.z);
+                float3 v_revolution = make_float3(rev_omega * (-r_rev.z), 0.0f,
+                                                   rev_omega * r_rev.x);
+                // Self-spin: v_spin = omega_self x (pos - paddle_center_near)
+                float3 r_spin = make_float3(h_pos[i].x - near_center.x, 0.0f,
+                                             h_pos[i].z - near_center.z);
+                float3 v_spin = make_float3(near_spin_omega * (-r_spin.z), 0.0f,
+                                             near_spin_omega * r_spin.x);
+                h_vel[i] = make_float3((v_revolution.x + v_spin.x) * dt_f,
+                                        0.0f,
+                                        (v_revolution.z + v_spin.z) * dt_f);
+            }
+
+            // Update far markers
+            for (size_t i = 0; i < nFarMarkers; ++i) {
+                float3 v_phys = far_rel[i];
+                float3 v_lu = make_float3(v_phys.x * phys_to_lattice,
+                                           v_phys.y * phys_to_lattice,
+                                           v_phys.z * phys_to_lattice);
+                float3 v_rot = rotateAxis(v_lu, axis, far_spin_angle);
+                size_t idx = nNearMarkers + i;
+                h_pos[idx] = make_float3(far_center.x + v_rot.x,
+                                          far_center.y + v_rot.y,
+                                          far_center.z + v_rot.z);
+
+                float3 r_rev = make_float3(h_pos[idx].x - paddle_center.x, 0.0f,
+                                            h_pos[idx].z - paddle_center.z);
+                float3 v_revolution = make_float3(rev_omega * (-r_rev.z), 0.0f,
+                                                   rev_omega * r_rev.x);
+                float3 r_spin = make_float3(h_pos[idx].x - far_center.x, 0.0f,
+                                             h_pos[idx].z - far_center.z);
+                float3 v_spin = make_float3(far_spin_omega * (-r_spin.z), 0.0f,
+                                             far_spin_omega * r_spin.x);
+                h_vel[idx] = make_float3((v_revolution.x + v_spin.x) * dt_f,
+                                          0.0f,
+                                          (v_revolution.z + v_spin.z) * dt_f);
+            }
+
+            ibm.updateMarkers(h_pos.data(), h_vel.data(), h_area.data());
+        }
+
+        // (b) IBM force
+        CHECK_CUDA(cudaMemset(d_force, 0, N * sizeof(float3)));
+        if (paddle_loaded && nTotalMarkers > 0) {
+            ibm.computeForces(lbm.velocityAoSPtr(), nullptr, d_force, 1.0f);
+        }
         lbm.setExternalForceFromDeviceAoS(d_force);
+
+        // (c) Free surface + LBM step
+        fsModule.preStream(ctx);
         lbm.streamCollide();
+        fsModule.postStream(ctx);
         lbm.updateMacroscopic();
 
         // Diagnostics
-        if (t % 100 == 0) {
+        if (t % 200 == 0) {
             std::vector<float> h_rho(N);
             CHECK_CUDA(cudaMemcpy(h_rho.data(), lbm.getDensityField(),
                                   N * sizeof(float), cudaMemcpyDeviceToHost));
@@ -456,21 +691,41 @@ int main(int argc, char** argv) {
                     if (r > rho_max) rho_max = r;
                 }
             }
+
+            // Max velocity magnitude
+            std::vector<float3> h_u_diag(N);
+            CHECK_CUDA(cudaMemcpy(h_u_diag.data(), lbm.velocityAoSPtr(),
+                                  N * sizeof(float3), cudaMemcpyDeviceToHost));
+            float u_max = 0.0f;
+            for (int i = 0; i < N; ++i) {
+                float u2 = h_u_diag[i].x*h_u_diag[i].x + h_u_diag[i].y*h_u_diag[i].y + h_u_diag[i].z*h_u_diag[i].z;
+                if (u2 > u_max) u_max = u2;
+            }
+            u_max = sqrtf(u_max);
+
+            // Max marker velocity
+            float v_marker_max = 0.0f;
+            for (size_t i = 0; i < nTotalMarkers; ++i) {
+                float v2 = h_vel[i].x*h_vel[i].x + h_vel[i].y*h_vel[i].y + h_vel[i].z*h_vel[i].z;
+                if (v2 > v_marker_max) v_marker_max = v2;
+            }
+            v_marker_max = sqrtf(v_marker_max);
+
             std::cout << "Step " << t << " t=" << std::fixed << std::setprecision(4)
-                      << time_sec << "s rho=[" << rho_min << "," << rho_max << "]"
+                      << time_sec << "s rho=[" << rho_min << "," << rho_max
+                      << "] u_max=" << std::setprecision(6) << u_max
+                      << " v_marker=" << v_marker_max
                       << std::endl;
         }
 
         // Output
         if (t > 0 && t % output_every == 0) {
-            float3* u_aos = lbm.velocityAoSPtr();
-
             auto h_rho = fields.create({"Density", (size_t)N, sizeof(float)});
             CHECK_CUDA(cudaMemcpy(h_rho.data(), lbm.getDensityField(),
                                   N * sizeof(float), cudaMemcpyDeviceToHost));
 
             auto h_u = fields.create({"Velocity", (size_t)N, sizeof(float) * 3});
-            CHECK_CUDA(cudaMemcpy(h_u.data(), u_aos, N * sizeof(float3), cudaMemcpyDeviceToHost));
+            CHECK_CUDA(cudaMemcpy(h_u.data(), lbm.velocityAoSPtr(), N * sizeof(float3), cudaMemcpyDeviceToHost));
 
             std::vector<float> speed(N);
             float3* cpu_u = (float3*)h_u.data();
@@ -479,12 +734,9 @@ int main(int argc, char** argv) {
             auto h_speed = fields.create({"Speed", (size_t)N, sizeof(float)});
             memcpy(h_speed.data(), speed.data(), N * sizeof(float));
 
-            std::vector<float> flags_f(N);
-            std::vector<uint8_t> h_flags(N);
-            CHECK_CUDA(cudaMemcpy(h_flags.data(), lbm.flagsDevicePtr(), N * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-            for (int i = 0; i < N; ++i) flags_f[i] = (float)h_flags[i];
-            auto h_fl = fields.create({"Flags", (size_t)N, sizeof(float)});
-            memcpy(h_fl.data(), flags_f.data(), N * sizeof(float));
+            // Fill (phi) for free surface visualization
+            auto h_fill = fields.create({"Fill", (size_t)N, sizeof(float)});
+            CHECK_CUDA(cudaMemcpy(h_fill.data(), lbm.phiDevicePtr(), N * sizeof(float), cudaMemcpyDeviceToHost));
 
             vtk_svc.onStepEnd(ctx);
 
@@ -502,7 +754,9 @@ int main(int argc, char** argv) {
     }
 
     vtk_svc.finalize(ctx);
+    fsModule.finalize();
     CHECK_CUDA(cudaFree(d_force));
     std::cout << "=== Simulation complete ===" << std::endl;
     return 0;
 }
+
