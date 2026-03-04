@@ -1,2 +1,3 @@
 # planetary_mixing/CMakeLists.txt
 add_subdirectory(planetary_spinning_test)
+add_subdirectory(planetary_mixing_test)
